@@ -1,35 +1,35 @@
 # Kilo x Snowflake Cortex
 
-Run [Kilo Code](https://kilocode.ai) against **Snowflake Cortex** models -- Claude Opus 5, Sonnet 5, GPT 5.4 -- with full agentic tool calling, through a local OpenAI-compatible proxy.
+Run [Kilo Code](https://kilocode.ai) against **Snowflake Cortex** models -- Claude Opus 5, Sonnet 5, GPT 5.4 -- with full agentic tool calling.
 
 Your code and prompts stay inside your Snowflake perimeter. No third-party model API keys required.
 
 ## How it works
 
-Kilo Code speaks the OpenAI **Responses API**. Snowflake Cortex speaks the **Cortex Agent API**. The proxy sits between them and translates both directions, including the tool-calling round trip:
+Snowflake Cortex natively supports the **OpenAI Chat Completions API** at `/api/v2/cortex/v1/chat/completions`. Kilo Code points directly at Snowflake -- no proxy needed for inference.
+
+The **auth sidecar** manages token lifecycle (minting, refreshing, persisting) and writes a valid Bearer token into `kilo.json` so Kilo always has a fresh credential:
 
 ```
-Kilo Code (Responses API)
-    |
-    |  POST /v1/responses
-    |  SSE: output_text.delta / function_call
+snowflake-auth-sidecar.py
+    |  authenticates (PAT / keypair / OAuth / device code)
+    |  writes Bearer token into kilo.json
     v
-snowflake-cortex-proxy.py  (localhost:8080)
+kilo.json  -->  Kilo Code  -->  Snowflake Cortex (OpenAI API)
+    ^                               /api/v2/cortex/v1/chat/completions
     |
-    |  POST /api/v2/cortex/agent:run
-    |  SSE: response.text.delta / response.tool_use
-    v
-Snowflake Cortex  (Claude / GPT)
+    +-- refreshes token before expiry
 ```
 
-Kilo executes tools locally (`bash`, `read`, `edit`, `grep`, ...) and the proxy replays each result back to Cortex so the model knows its commands already ran.
+For advanced use cases (server-side Cortex Agent tools like Cortex Search, Cortex Analyst, SQL execution), the **translating proxy** is also included. It translates between Kilo's OpenAI Responses API and Snowflake's Cortex Agent API.
 
 ## Requirements
 
-- Python 3.9+ (3.11+ for `~/.snowflake/config.toml` support)
+- Python 3.9+
 - [Kilo Code CLI](https://kilocode.ai) -- `npm install -g @kilocode/cli`
 - A Snowflake account with Cortex enabled
 - A Snowflake **programmatic access token (PAT)**, keypair, or OAuth credentials
+- `pip install PyJWT cryptography` (for keypair or OAuth auth)
 
 ## Quick start
 
@@ -44,31 +44,13 @@ cd kilo-snowflake-cortex
 run.bat
 ```
 
-On first run, `setup.sh` / `setup.bat` will prompt for your Snowflake account, user, and PAT, then generate `~/.config/kilo/kilo.json` with the proxy config and model catalog. After setup, it starts the proxy and launches Kilo.
-
-Subsequent runs skip setup and start instantly (the proxy survives Kilo exiting).
-
-```bash
-./run.sh --no-kilo      # start proxy only
-./run.sh --stop         # stop the proxy
-./run.sh --status       # check proxy health
-```
-
-For CI or non-interactive use:
-
-```bash
-SNOWFLAKE_PAT=... ./setup.sh --account MYORG-MYACCOUNT --user me@example.com \
-    --warehouse MY_WH --role MY_ROLE --non-interactive
-./run.sh
-```
+On first run, `setup.sh` / `setup.bat` will prompt for your Snowflake account, user, and PAT, then generate `~/.config/kilo/kilo.json`. After setup, it starts the auth sidecar and launches Kilo.
 
 ### Manual setup
 
-If you prefer to configure everything by hand:
-
 #### 1. Configure Kilo
 
-Create or edit `~/.config/kilo/kilo.json` (on Windows: `%APPDATA%\kilo\kilo.json`):
+Create or edit `~/.config/kilo/kilo.json`:
 
 ```json
 {
@@ -90,10 +72,10 @@ Create or edit `~/.config/kilo/kilo.json` (on Windows: `%APPDATA%\kilo\kilo.json
 
     "openai": {
       "name": "Snowflake Cortex",
-      "api": "http://127.0.0.1:8080/v1",
+      "api": "https://MYORG-MYACCOUNT.snowflakecomputing.com/api/v2/cortex/v1",
       "options": {
-        "baseURL": "http://127.0.0.1:8080/v1",
-        "apiKey": "sk-local-proxy"
+        "baseURL": "https://MYORG-MYACCOUNT.snowflakecomputing.com/api/v2/cortex/v1",
+        "apiKey": "YOUR_PAT_OR_JWT_HERE"
       },
       "models": {
         "claude-opus-5": {
@@ -112,12 +94,16 @@ Create or edit `~/.config/kilo/kilo.json` (on Windows: `%APPDATA%\kilo\kilo.json
 }
 ```
 
-> Run `python3 proxy/snowflake-cortex-proxy.py --print-kilo-models` to generate the full model block with all available models and correct context windows.
+> The `provider.openai.options.apiKey` is managed by the auth sidecar. For PAT auth, you can set it manually and skip the sidecar.
 
-#### 2. Start the proxy
+#### 2. Start the auth sidecar (for non-PAT auth)
 
 ```bash
-python3 proxy/snowflake-cortex-proxy.py
+# Authenticate once and update kilo.json
+python3 proxy/snowflake-auth-sidecar.py --once
+
+# Or run continuously (refreshes tokens before expiry)
+python3 proxy/snowflake-auth-sidecar.py
 ```
 
 #### 3. Launch Kilo
@@ -126,11 +112,67 @@ python3 proxy/snowflake-cortex-proxy.py
 kilo
 ```
 
-Select a Snowflake Cortex model from the picker and start coding.
+## Authentication
+
+Set `auth.type` in `provider.snowflake-cortex`:
+
+| Type | Fields | Notes |
+|---|---|---|
+| `pat` | `auth.pat` | Static token. Sidecar writes it to `apiKey` once. Simplest option |
+| `privatekey` | `auth.private_key_path` | Keypair JWT. Sidecar re-mints every 55 min. Requires `cryptography` + `PyJWT` |
+| `snowflake_oauth` | `auth.client_id`, `auth.client_secret` | Authorization code + PKCE. Opens browser. Refresh tokens persisted across restarts |
+| `device_code` | `auth.client_id`, `auth.device_authorization_endpoint`, `auth.token_endpoint`, `auth.scope` | External OAuth. Displays code for browser. Refresh tokens persisted |
+
+### Config examples
+
+**PAT** (simplest):
+```json
+"auth": { "type": "pat", "pat": "eyJra..." }
+```
+
+**Keypair JWT**:
+```json
+"auth": {
+  "type": "privatekey",
+  "private_key_path": "~/.snowflake/rsa_key.p8"
+}
+```
+
+**Snowflake OAuth** (browser-based):
+```json
+"auth": {
+  "type": "snowflake_oauth",
+  "client_id": "from DESCRIBE INTEGRATION",
+  "client_secret": "from SYSTEM$SHOW_OAUTH_CLIENT_SECRETS()"
+}
+```
+
+**External OAuth device code**:
+```json
+"auth": {
+  "type": "device_code",
+  "client_id": "my-app-client-id",
+  "device_authorization_endpoint": "https://idp.example.com/device/authorize",
+  "token_endpoint": "https://idp.example.com/oauth/token",
+  "scope": "session:role:MY_ROLE"
+}
+```
+
+### Auth sidecar CLI
+
+```bash
+python3 proxy/snowflake-auth-sidecar.py --once       # authenticate once, update kilo.json, exit
+python3 proxy/snowflake-auth-sidecar.py               # run continuously with refresh loop
+python3 proxy/snowflake-auth-sidecar.py --status      # show current auth state
+python3 proxy/snowflake-auth-sidecar.py --verify      # verify the token in kilo.json works
+python3 proxy/snowflake-auth-sidecar.py --provider X  # write to provider.X instead of provider.openai
+```
+
+The sidecar persists refresh tokens in `~/.config/kilo/snowflake-auth-state.json` so it can resume without re-prompting after a restart.
 
 ## Models
 
-The proxy's `MODEL_CATALOG` is the single source of truth for context windows, output limits, and routing. Available models (depends on account/region):
+Available models (depends on account/region):
 
 | Model | Context | Max output |
 |---|---:|---:|
@@ -141,13 +183,11 @@ The proxy's `MODEL_CATALOG` is the single source of truth for context windows, o
 | `openai-gpt-5.4` | 400,000 | 128,000 |
 | `openai-gpt-5.2` | 272,000 | 8,192 |
 
-`small_model` (title generation) defaults to `claude-haiku-4-5` to avoid burning Opus credits on housekeeping.
+Run `python3 proxy/snowflake-cortex-proxy.py --print-kilo-models` to generate the full model block for kilo.json.
 
 ## Querying Snowflake data via MCP
 
-The proxy handles **inference** (the model). To give Kilo the ability to **query Snowflake data**, register a Snowflake managed MCP server in your `kilo.json`. Snowflake hosts managed MCP servers that provide SQL query execution, object management, semantic views, and Cortex AI services. See [Snowflake MCP documentation](https://docs.snowflake.com) for available options.
-
-To register any MCP server in Kilo, add an `mcp` block to `kilo.json`:
+The auth sidecar handles **inference credentials**. To give Kilo the ability to **query Snowflake data**, register a Snowflake managed MCP server in `kilo.json`:
 
 ```json
 {
@@ -162,97 +202,23 @@ To register any MCP server in Kilo, add an `mcp` block to `kilo.json`:
 }
 ```
 
-## Authentication
+## Translating proxy (advanced)
 
-The proxy supports multiple auth methods. Set the `auth.type` field in `provider.snowflake-cortex`:
+For server-side Cortex Agent tools (Cortex Search, Cortex Analyst, SQL execution), the translating proxy translates between Kilo's OpenAI Responses API and Snowflake's Cortex Agent API:
 
-| Type | Fields | Notes |
-|---|---|---|
-| `pat` | `auth.pat` | Programmatic access token (recommended for getting started) |
-| `privatekey` | `auth.private_key_path`, `auth.private_key_passphrase` | Keypair JWT -- recommended for production / service accounts. Requires `cryptography` package |
-| `snowflake_oauth` | `auth.client_id`, `auth.client_secret`, `auth.scope` | Snowflake OAuth (authorization code + PKCE). Opens browser to authorize. Requires a Snowflake OAuth security integration |
-| `device_code` | `auth.client_id`, `auth.device_authorization_endpoint`, `auth.token_endpoint`, `auth.scope` | External OAuth device code flow. Displays a code to enter in browser. Requires an external OAuth integration in Snowflake |
-
-### Config examples
-
-**PAT** (simplest):
-```json
-"auth": { "type": "pat", "pat": "eyJra..." }
+```bash
+python3 proxy/snowflake-cortex-proxy.py
 ```
 
-**Keypair JWT** (no secrets stored in Snowflake):
-```json
-"auth": {
-  "type": "privatekey",
-  "private_key_path": "~/.snowflake/rsa_key.p8",
-  "private_key_passphrase": ""
-}
-```
-
-**Snowflake OAuth** (browser-based, supports refresh):
-```json
-"auth": {
-  "type": "snowflake_oauth",
-  "client_id": "from DESCRIBE INTEGRATION",
-  "client_secret": "from SYSTEM$SHOW_OAUTH_CLIENT_SECRETS()",
-  "scope": "session:role:MY_ROLE"
-}
-```
-
-**External OAuth device code** (for external IdPs like Azure AD, Okta):
-```json
-"auth": {
-  "type": "device_code",
-  "client_id": "my-app-client-id",
-  "device_authorization_endpoint": "https://idp.example.com/device/authorize",
-  "token_endpoint": "https://idp.example.com/oauth/token",
-  "scope": "snowflake"
-}
-```
-
-
-## Configuration reference
-
-### Environment variables
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `PROXY_PORT` | `8080` | Listen port |
-| `PROXY_RAW_LOG` | `/tmp/kilo-raw.jsonl` | Full request capture; set empty to disable |
-| `PROXY_UPSTREAM_TIMEOUT` | `600` | Upstream read timeout (seconds) |
-| `PROXY_MAX_TOOL_STEPS` | `30` | Tool calls per conversation before forcing an answer |
-| `PROXY_REPEAT_TOOL_LIMIT` | `2` | Identical tool calls allowed before blocking a loop |
-
-### Endpoints
-
-| Path | Method | Purpose |
-|---|---|---|
-| `/v1/responses` | POST | Responses API (primary -- what Kilo uses) |
-| `/v1/chat/completions` | POST | Chat Completions API (alternative) |
-| `/v1/models` | GET | List available models |
-| `/health` | GET | Health check with token age |
-
-## Safety
-
-- **Read-only by default** -- the proxy does not grant any write access to Snowflake. It is an inference proxy only.
-- **Loop protection** -- identical tool calls are capped at 2 per conversation. A hard ceiling of 30 total tool steps prevents runaway sessions.
-- **`PROXY_RAW_LOG`** captures full request bodies for debugging. Treat it as sensitive or disable it.
-
-## Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| Kilo says "Cannot connect to API" | Proxy isn't running -- use `./run.sh` or `python3 proxy/snowflake-cortex-proxy.py` |
-| Model answers nothing, returns fast | Session token expired. Proxy auto-refreshes; check `curl localhost:8080/health` |
-| `Unknown model 'gpt-4o'` | That's Kilo's built-in OpenAI catalog, not a Cortex model. Pick a Snowflake Cortex entry |
-| Model rejected as unavailable | Account/region entitlement. The error includes Snowflake's reason |
-| Proxy won't start, port in use | `lsof -i :8080` (macOS/Linux) or `netstat -aon | findstr :8080` (Windows), or set `PROXY_PORT=8081` |
+This is only needed if you want Snowflake to orchestrate tools server-side. For most use cases, the native OpenAI API with client-side MCP is sufficient.
 
 ## Layout
 
 ```
-run.sh / run.bat                 launch proxy + kilo (calls setup if needed)
-setup.sh / setup.bat             generate kilo.json interactively or via env vars
-proxy/snowflake-cortex-proxy.py  the translating proxy (single file, stdlib only)
+proxy/snowflake-auth-sidecar.py  auth token manager (primary)
+proxy/snowflake-cortex-proxy.py  translating proxy for Cortex Agent API (advanced)
+test/idp.py                      throwaway OIDC IdP for testing device code flow
+run.sh / run.bat                 launch scripts
+setup.sh / setup.bat             generate kilo.json interactively
 LICENSE                          MIT
 ```
