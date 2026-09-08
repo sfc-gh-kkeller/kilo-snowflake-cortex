@@ -6,22 +6,18 @@ Your code and prompts stay inside your Snowflake perimeter. No third-party model
 
 ## How it works
 
-Snowflake Cortex natively supports the **OpenAI Chat Completions API** at `/api/v2/cortex/v1/chat/completions`. Kilo Code points directly at Snowflake -- no proxy needed for inference.
-
-The **auth sidecar** manages token lifecycle (minting, refreshing, persisting) and writes a valid Bearer token into `kilo.json` so Kilo always has a fresh credential:
+Snowflake Cortex natively supports the **OpenAI Chat Completions API** at `/api/v2/cortex/v1/chat/completions`. The **`ksc` launcher** manages auth profiles, starts a lightweight proxy (fixes `max_tokens` compatibility), and launches Kilo in one command:
 
 ```
-snowflake-auth-sidecar.py
-    |  authenticates (PAT / keypair / OAuth / device code)
-    |  writes Bearer token into kilo.json
+ksc <profile>
+    |  loads auth profile (PAT / keypair / OAuth / device code)
+    |  starts proxy on 127.0.0.1:8080
+    |  launches kilo
     v
-kilo.json  -->  Kilo Code  -->  Snowflake Cortex (OpenAI API)
-    ^                               /api/v2/cortex/v1/chat/completions
-    |
-    +-- refreshes token before expiry
+Kilo  -->  proxy  -->  Snowflake Cortex
+           fixes max_tokens,
+           injects auth token
 ```
-
-For advanced use cases (server-side Cortex Agent tools like Cortex Search, Cortex Analyst, SQL execution), the **translating proxy** is also included. It translates between Kilo's OpenAI Responses API and Snowflake's Cortex Agent API.
 
 ## Requirements
 
@@ -29,7 +25,7 @@ For advanced use cases (server-side Cortex Agent tools like Cortex Search, Corte
 - [Kilo Code CLI](https://kilocode.ai) -- `npm install -g @kilocode/cli`
 - A Snowflake account with Cortex enabled
 - A Snowflake **programmatic access token (PAT)**, keypair, or OAuth credentials
-- `pip install PyJWT cryptography` (for keypair or OAuth auth)
+- `pip install PyJWT cryptography` (only for keypair or OAuth auth)
 
 ## Quick start
 
@@ -37,6 +33,21 @@ For advanced use cases (server-side Cortex Agent tools like Cortex Search, Corte
 git clone https://github.com/sfc-gh-kkeller/kilo-snowflake-cortex.git
 cd kilo-snowflake-cortex
 
+# Install ksc onto PATH
+./install-ksc.sh
+
+# Add your first profile
+ksc add myaccount
+
+# Launch
+ksc myaccount
+```
+
+`ksc add` prompts for account, user, auth type, and credentials. Profiles are stored in `~/.config/kilo/ksc-profiles.json`.
+
+### Legacy setup (without ksc)
+
+```bash
 # macOS / Linux
 ./run.sh
 
@@ -44,131 +55,95 @@ cd kilo-snowflake-cortex
 run.bat
 ```
 
-On first run, `setup.sh` / `setup.bat` will prompt for your Snowflake account, user, and PAT, then generate `~/.config/kilo/kilo.json`. After setup, it starts the auth sidecar and launches Kilo.
+On first run, `setup.sh` will prompt for your Snowflake account, user, and PAT, then generate `~/.config/kilo/kilo.json`.
 
-### Manual setup
-
-#### 1. Configure Kilo
-
-Create or edit `~/.config/kilo/kilo.json`:
-
-```json
-{
-  "$schema": "https://app.kilo.ai/config.json",
-  "model": "openai/claude-opus-5",
-  "small_model": "openai/claude-haiku-4-5",
-
-  "provider": {
-    "snowflake-cortex": {
-      "account": "MYORG-MYACCOUNT",
-      "user": "me@example.com",
-      "auth": {
-        "type": "pat",
-        "pat": "YOUR_PAT_HERE"
-      },
-      "warehouse": "MY_WH",
-      "role": "MY_ROLE"
-    },
-
-    "openai": {
-      "name": "Snowflake Cortex",
-      "api": "https://MYORG-MYACCOUNT.snowflakecomputing.com/api/v2/cortex/v1",
-      "options": {
-        "baseURL": "https://MYORG-MYACCOUNT.snowflakecomputing.com/api/v2/cortex/v1",
-        "apiKey": "YOUR_PAT_OR_JWT_HERE"
-      },
-      "models": {
-        "claude-opus-5": {
-          "name": "Snowflake Cortex | Claude Opus 5",
-          "tool_call": true,
-          "limit": { "context": 1000000, "output": 128000 }
-        },
-        "claude-sonnet-5": {
-          "name": "Snowflake Cortex | Claude Sonnet 5",
-          "tool_call": true,
-          "limit": { "context": 1000000, "output": 64000 }
-        }
-      }
-    }
-  }
-}
-```
-
-> The `provider.openai.options.apiKey` is managed by the auth sidecar. For PAT auth, you can set it manually and skip the sidecar.
-
-#### 2. Start the auth sidecar (for non-PAT auth)
+## ksc CLI
 
 ```bash
-# Authenticate once and update kilo.json
-python3 proxy/snowflake-auth-sidecar.py --once
-
-# Or run continuously (refreshes tokens before expiry)
-python3 proxy/snowflake-auth-sidecar.py
+ksc                              # launch with default profile
+ksc <profile>                    # launch with named profile
+ksc <profile> -- run -m "..."    # launch kilo CLI with args
+ksc list                         # list profiles
+ksc add <name>                   # add profile interactively
+ksc remove <name>                # remove profile
+ksc default <name>               # set default profile
+ksc status                       # show proxy health
+ksc stop                         # stop running proxy
 ```
 
-#### 3. Launch Kilo
+### Profile examples
 
-```bash
-kilo
-```
-
-## Authentication
-
-Set `auth.type` in `provider.snowflake-cortex`:
-
-| Type | Fields | Notes |
-|---|---|---|
-| `pat` | `auth.pat` | Static token. Sidecar writes it to `apiKey` once. Simplest option |
-| `privatekey` | `auth.private_key_path` | Keypair JWT. Sidecar re-mints every 55 min. Requires `cryptography` + `PyJWT` |
-| `snowflake_oauth` | `auth.client_id`, `auth.client_secret` | Authorization code + PKCE. Opens browser. Refresh tokens persisted across restarts |
-| `device_code` | `auth.client_id`, `auth.device_authorization_endpoint`, `auth.token_endpoint`, `auth.scope` | External OAuth. Displays code for browser. Refresh tokens persisted |
-
-### Config examples
+Each profile stores a complete auth configuration:
 
 **PAT** (simplest):
-```json
-"auth": { "type": "pat", "pat": "eyJra..." }
+```bash
+ksc add prod
+# Account: MYORG-MYACCOUNT
+# User: me@example.com
+# Auth type: pat
+# PAT: <hidden>
 ```
 
 **Keypair JWT**:
-```json
-"auth": {
-  "type": "privatekey",
-  "private_key_path": "~/.snowflake/rsa_key.p8"
-}
+```bash
+ksc add dev-keypair
+# Auth type: privatekey
+# Private key path: ~/.snowflake/rsa_key.p8
 ```
 
 **Snowflake OAuth** (browser-based):
-```json
-"auth": {
-  "type": "snowflake_oauth",
-  "client_id": "from DESCRIBE INTEGRATION",
-  "client_secret": "from SYSTEM$SHOW_OAUTH_CLIENT_SECRETS()"
-}
+```bash
+ksc add staging-oauth
+# Auth type: snowflake_oauth
+# Client ID: from DESCRIBE INTEGRATION
+# Client secret: <hidden>
 ```
 
 **External OAuth device code**:
-```json
-"auth": {
-  "type": "device_code",
-  "client_id": "my-app-client-id",
-  "device_authorization_endpoint": "https://idp.example.com/device/authorize",
-  "token_endpoint": "https://idp.example.com/oauth/token",
-  "scope": "session:role:MY_ROLE"
-}
+```bash
+ksc add corp-sso
+# Auth type: device_code
+# Client ID: my-app-client-id
+# Device auth endpoint: https://idp.example.com/device/authorize
+# Token endpoint: https://idp.example.com/oauth/token
 ```
 
-### Auth sidecar CLI
+### Persisting refresh tokens
+
+By default, refresh tokens are kept in memory only (most secure). To persist them across restarts:
 
 ```bash
-python3 proxy/snowflake-auth-sidecar.py --once       # authenticate once, update kilo.json, exit
-python3 proxy/snowflake-auth-sidecar.py               # run continuously with refresh loop
-python3 proxy/snowflake-auth-sidecar.py --status      # show current auth state
-python3 proxy/snowflake-auth-sidecar.py --verify      # verify the token in kilo.json works
-python3 proxy/snowflake-auth-sidecar.py --provider X  # write to provider.X instead of provider.openai
+ksc myprofile --persist-refresh-token
 ```
 
-The sidecar persists refresh tokens in `~/.config/kilo/snowflake-auth-state.json` so it can resume without re-prompting after a restart.
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `KSC_PORT` | `8080` | Proxy listen port |
+| `XDG_CONFIG_HOME` | `~/.config` | Config directory |
+
+## Authentication
+
+Set `auth.type` in the profile:
+
+| Type | Fields | Notes |
+|---|---|---|
+| `pat` | `auth.pat` | Static token. Simplest option |
+| `privatekey` | `auth.private_key_path` | Keypair JWT. Re-minted every 55 min. Requires `cryptography` + `PyJWT` |
+| `snowflake_oauth` | `auth.client_id`, `auth.client_secret` | Authorization code + PKCE. Opens browser |
+| `device_code` | `auth.client_id`, `auth.device_authorization_endpoint`, `auth.token_endpoint`, `auth.scope` | External OAuth. Displays code for browser |
+
+### Auth sidecar (standalone)
+
+The proxy/sidecar can also be used directly without `ksc`:
+
+```bash
+python3 proxy/snowflake-auth-sidecar.py --proxy     # proxy mode (recommended)
+python3 proxy/snowflake-auth-sidecar.py --once       # authenticate once and exit
+python3 proxy/snowflake-auth-sidecar.py --status     # show auth state
+python3 proxy/snowflake-auth-sidecar.py --verify     # verify current token
+```
 
 ## Models
 
@@ -182,8 +157,6 @@ Available models (depends on account/region):
 | `claude-opus-4-5` / `sonnet-4-5` / `haiku-4-5` | 200,000 | 64,000 |
 | `openai-gpt-5.4` | 400,000 | 128,000 |
 | `openai-gpt-5.2` | 272,000 | 8,192 |
-
-Run `python3 proxy/snowflake-cortex-proxy.py --print-kilo-models` to generate the full model block for kilo.json.
 
 ## Querying Snowflake data via MCP
 
@@ -215,10 +188,12 @@ This is only needed if you want Snowflake to orchestrate tools server-side. For 
 ## Layout
 
 ```
-proxy/snowflake-auth-sidecar.py  auth token manager (primary)
-proxy/snowflake-cortex-proxy.py  translating proxy for Cortex Agent API (advanced)
-test/idp.py                      throwaway OIDC IdP for testing device code flow
-run.sh / run.bat                 launch scripts
-setup.sh / setup.bat             generate kilo.json interactively
-LICENSE                          MIT
+proxy/ksc.py                    ksc launcher (profiles + proxy + kilo)
+proxy/snowflake-auth-sidecar.py auth token manager and lightweight proxy
+proxy/snowflake-cortex-proxy.py translating proxy for Cortex Agent API (advanced)
+test/idp.py                     throwaway OIDC IdP for testing device code flow
+install-ksc.sh                  symlink ksc onto PATH
+run.sh / run.bat                legacy launch scripts
+setup.sh / setup.bat            generate kilo.json interactively
+LICENSE                         MIT
 ```
