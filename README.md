@@ -2,6 +2,16 @@
 
 Use [Kilo Code](https://kilocode.ai) with **Snowflake Cortex** models -- Claude Opus 5, Sonnet 5, GPT 5.4 -- with full agentic tool calling. Your code and prompts stay inside your Snowflake perimeter. No third-party model API keys required.
 
+<p align="center">
+  <img src="docs/kilo1.png" width="700" alt="Kilo CLI with Snowflake Cortex — Claude Opus 5">
+</p>
+<p align="center">
+  <img src="docs/kilo2.png" width="700" alt="Kilo session — token usage, model details, Snowflake Cortex">
+</p>
+<p align="center">
+  <img src="docs/kilo3.png" width="700" alt="ksc launch flow — proxy startup and on-exit prompt">
+</p>
+
 ## Why
 
 Connecting Kilo to Snowflake Cortex today means manually wiring up authentication, figuring out which API endpoint and provider config to use, translating incompatible request parameters, and refreshing tokens before they expire. That's a lot of friction before you can write your first prompt.
