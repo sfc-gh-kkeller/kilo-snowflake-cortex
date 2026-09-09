@@ -10,10 +10,12 @@ Manages named auth profiles and launches Kilo with a running proxy.
     ksc add <name>            # add profile interactively
     ksc remove <name>         # remove profile
     ksc default <name>        # set default profile
+    ksc setup                 # write model catalog + defaults into kilo.json
+    ksc start <profile>       # start proxy only (no kilo)
     ksc status                # show proxy/auth health
     ksc stop                  # stop running proxy
+    ksc version               # show version
 
-    ksc start <profile>          # start proxy only (no kilo)
     ksc <profile> --force-reauth   # force full re-authentication
 """
 from __future__ import annotations
@@ -21,33 +23,113 @@ from __future__ import annotations
 import getpass
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# -- ANSI --
-BOLD = "\033[1m"
-DIM = "\033[2m"
-RED = "\033[91m"
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-BLUE = "\033[94m"
-CYAN = "\033[96m"
-RESET = "\033[0m"
+VERSION = "0.2.0"
+IS_WINDOWS = sys.platform == "win32"
 
-# -- Paths --
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "kilo"
+# -- ANSI (disabled on Windows unless WT/modern terminal) --
+if IS_WINDOWS and "WT_SESSION" not in os.environ:
+    BOLD = DIM = RED = GREEN = YELLOW = BLUE = CYAN = RESET = ""
+else:
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    RESET = "\033[0m"
+
+# -- Paths (platform-aware) --
+if IS_WINDOWS:
+    _appdata = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    CONFIG_DIR = _appdata / "kilo"
+    STATE_DIR = Path(os.environ.get("LOCALAPPDATA",
+                     Path.home() / "AppData" / "Local")) / "kilo-snowflake-cortex"
+else:
+    CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME",
+                      Path.home() / ".config")) / "kilo"
+    STATE_DIR = Path(os.environ.get("XDG_STATE_HOME",
+                     Path.home() / ".local" / "state")) / "kilo-snowflake-cortex"
+
 KILO_CONFIG = CONFIG_DIR / "kilo.json"
 PROFILES_FILE = CONFIG_DIR / "ksc-profiles.json"
-STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "kilo-snowflake-cortex"
 PIDFILE = STATE_DIR / "proxy.pid"
 LOGFILE = STATE_DIR / "proxy.log"
 
 SIDECAR = Path(__file__).resolve().parent / "snowflake-auth-sidecar.py"
 DEFAULT_PORT = 8080
+
+
+# =========================================================================
+# Model catalog — available Cortex models for kilo.json
+# =========================================================================
+
+CORTEX_MODELS = {
+    "claude-opus-5": {
+        "name": "Snowflake Cortex | Claude Opus 5",
+        "tool_call": True,
+        "limit": {"context": 1000000, "output": 128000},
+    },
+    "claude-opus-4-8": {
+        "name": "Snowflake Cortex | Claude Opus 4.8",
+        "tool_call": True,
+        "limit": {"context": 1000000, "output": 128000},
+    },
+    "claude-opus-4-7": {
+        "name": "Snowflake Cortex | Claude Opus 4.7",
+        "tool_call": True,
+        "limit": {"context": 1000000, "output": 128000},
+    },
+    "claude-opus-4-6": {
+        "name": "Snowflake Cortex | Claude Opus 4.6",
+        "tool_call": True,
+        "limit": {"context": 1000000, "output": 128000},
+    },
+    "claude-sonnet-5": {
+        "name": "Snowflake Cortex | Claude Sonnet 5",
+        "tool_call": True,
+        "limit": {"context": 1000000, "output": 64000},
+    },
+    "claude-sonnet-4-6": {
+        "name": "Snowflake Cortex | Claude Sonnet 4.6",
+        "tool_call": True,
+        "limit": {"context": 1000000, "output": 64000},
+    },
+    "claude-opus-4-5": {
+        "name": "Snowflake Cortex | Claude Opus 4.5",
+        "tool_call": True,
+        "limit": {"context": 200000, "output": 64000},
+    },
+    "claude-sonnet-4-5": {
+        "name": "Snowflake Cortex | Claude Sonnet 4.5",
+        "tool_call": True,
+        "limit": {"context": 200000, "output": 64000},
+    },
+    "claude-haiku-4-5": {
+        "name": "Snowflake Cortex | Claude Haiku 4.5",
+        "tool_call": True,
+        "limit": {"context": 200000, "output": 64000},
+    },
+    "openai-gpt-5.4": {
+        "name": "Snowflake Cortex | OpenAI GPT 5.4",
+        "tool_call": True,
+        "limit": {"context": 400000, "output": 128000},
+    },
+    "openai-gpt-5.2": {
+        "name": "Snowflake Cortex | OpenAI GPT 5.2",
+        "tool_call": True,
+        "limit": {"context": 272000, "output": 8192},
+    },
+}
+
+DEFAULT_MODEL = "openai-compatible/claude-opus-5"
+DEFAULT_SMALL_MODEL = "openai-compatible/claude-haiku-4-5"
 
 
 # =========================================================================
@@ -68,7 +150,8 @@ def save_profiles(data: Dict[str, Any]) -> None:
         json.dump(data, f, indent=2)
         f.write("\n")
     os.replace(tmp, str(PROFILES_FILE))
-    os.chmod(str(PROFILES_FILE), 0o600)
+    if not IS_WINDOWS:
+        os.chmod(str(PROFILES_FILE), 0o600)
 
 
 def get_profile(name: Optional[str]) -> Dict[str, Any]:
@@ -94,7 +177,6 @@ def get_profile(name: Optional[str]) -> Dict[str, Any]:
 
 
 def read_kilo_snowflake_defaults() -> Dict[str, str]:
-    """Read current snowflake-cortex config from kilo.json for defaults."""
     defaults = {"account": "", "user": "", "warehouse": "", "role": ""}
     if KILO_CONFIG.exists():
         try:
@@ -115,8 +197,6 @@ def read_kilo_snowflake_defaults() -> Dict[str, str]:
 # =========================================================================
 
 def write_profile_to_kilo(profile: Dict[str, Any], port: int) -> None:
-    """Write the profile's auth config into kilo.json provider.snowflake-cortex
-    and point openai-compatible at the local proxy."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
     cfg: Dict[str, Any] = {}
@@ -126,7 +206,6 @@ def write_profile_to_kilo(profile: Dict[str, Any], port: int) -> None:
 
     provider = cfg.setdefault("provider", {})
 
-    # Write snowflake-cortex auth
     provider["snowflake-cortex"] = {
         "account": profile["account"],
         "user": profile["user"],
@@ -135,12 +214,40 @@ def write_profile_to_kilo(profile: Dict[str, Any], port: int) -> None:
         "role": profile.get("role", ""),
     }
 
-    # Point openai-compatible at local proxy
     proxy_url = f"http://127.0.0.1:{port}/v1"
     oc = provider.setdefault("openai-compatible", {})
     oc["api"] = proxy_url
     oc.setdefault("options", {})["baseURL"] = proxy_url
 
+    _write_kilo_config(cfg)
+
+
+def write_models_to_kilo(port: int = DEFAULT_PORT) -> None:
+    """Write the Cortex model catalog and defaults into kilo.json."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    cfg: Dict[str, Any] = {}
+    if KILO_CONFIG.exists():
+        with open(KILO_CONFIG) as f:
+            cfg = json.load(f)
+
+    cfg.setdefault("$schema", "https://app.kilo.ai/config.json")
+    cfg["model"] = DEFAULT_MODEL
+    cfg["small_model"] = DEFAULT_SMALL_MODEL
+
+    provider = cfg.setdefault("provider", {})
+    proxy_url = f"http://127.0.0.1:{port}/v1"
+    oc = provider.setdefault("openai-compatible", {})
+    oc.setdefault("name", "Snowflake Cortex")
+    oc["api"] = proxy_url
+    opts = oc.setdefault("options", {})
+    opts["baseURL"] = proxy_url
+    oc["models"] = CORTEX_MODELS
+
+    _write_kilo_config(cfg)
+
+
+def _write_kilo_config(cfg: Dict[str, Any]) -> None:
     tmp = str(KILO_CONFIG) + ".tmp"
     with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2)
@@ -149,11 +256,17 @@ def write_profile_to_kilo(profile: Dict[str, Any], port: int) -> None:
 
 
 # =========================================================================
-# Proxy management
+# Proxy management (cross-platform)
 # =========================================================================
 
 def proxy_pid() -> Optional[int]:
     """Find the PID of a proxy listening on the expected port."""
+    if IS_WINDOWS:
+        return _proxy_pid_windows()
+    return _proxy_pid_unix()
+
+
+def _proxy_pid_unix() -> Optional[int]:
     try:
         out = subprocess.check_output(
             ["lsof", "-nP", f"-iTCP:{DEFAULT_PORT}", "-sTCP:LISTEN", "-t"],
@@ -162,6 +275,20 @@ def proxy_pid() -> Optional[int]:
         return int(out.split("\n")[0]) if out else None
     except (subprocess.CalledProcessError, ValueError):
         return None
+
+
+def _proxy_pid_windows() -> Optional[int]:
+    try:
+        out = subprocess.check_output(
+            ["netstat", "-aon"], stderr=subprocess.DEVNULL, text=True,
+        )
+        for line in out.splitlines():
+            if f":{DEFAULT_PORT}" in line and "LISTENING" in line:
+                parts = line.strip().split()
+                return int(parts[-1])
+    except (subprocess.CalledProcessError, ValueError):
+        pass
+    return None
 
 
 def is_healthy(port: int = DEFAULT_PORT) -> bool:
@@ -179,18 +306,25 @@ def stop_proxy(quiet: bool = False) -> None:
         if not quiet:
             warn("proxy not running")
         return
-    os.kill(pid, signal.SIGTERM)
-    for _ in range(40):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.1)
+
+    if IS_WINDOWS:
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        import signal
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(40):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
     PIDFILE.unlink(missing_ok=True)
     if not quiet:
         ok(f"stopped proxy (PID {pid})")
@@ -220,19 +354,22 @@ def start_proxy(profile: Dict[str, Any], port: int, persist_refresh: bool = Fals
         cmd.append("--persist-refresh-token")
 
     interactive = _is_interactive_auth(profile)
+    log = open(LOGFILE, "w")
+
+    kwargs: Dict[str, Any] = {"stdout": log}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     if interactive:
-        # Show stderr so user sees device code / browser URL
-        log = open(LOGFILE, "w")
-        proc = subprocess.Popen(cmd, stdout=log, stderr=sys.stderr)
-        timeout = 300  # 5 min for user to approve
+        kwargs["stderr"] = sys.stderr
+        timeout = 300
     else:
-        log = open(LOGFILE, "w")
-        proc = subprocess.Popen(cmd, stdout=log, stderr=log)
+        kwargs["stderr"] = log
         timeout = 60
 
+    proc = subprocess.Popen(cmd, **kwargs)
     PIDFILE.write_text(str(proc.pid))
 
-    polls = timeout * 2  # 0.5s intervals
+    polls = timeout * 2
     for _ in range(polls):
         if is_healthy(port):
             return proc.pid
@@ -252,7 +389,7 @@ def start_proxy(profile: Dict[str, Any], port: int, persist_refresh: bool = Fals
         die(f"proxy didn't become healthy in {timeout}s:\n" + "\n".join(lines))
     else:
         die(f"proxy didn't become healthy in {timeout}s — auth may have timed out")
-    return 0  # unreachable
+    return 0
 
 
 # =========================================================================
@@ -302,7 +439,8 @@ def cmd_add(name: str) -> None:
         auth["pat"] = pat
 
     elif auth_type == "privatekey":
-        auth["private_key_path"] = _prompt("Private key path", "~/.snowflake/rsa_key.p8")
+        default_key = "~\\.snowflake\\rsa_key.p8" if IS_WINDOWS else "~/.snowflake/rsa_key.p8"
+        auth["private_key_path"] = _prompt("Private key path", default_key)
         pp = getpass.getpass("Passphrase (blank for none): ")
         if pp:
             auth["private_key_passphrase"] = pp
@@ -377,6 +515,23 @@ def cmd_default(name: str) -> None:
     ok(f"Default profile set to '{name}'")
 
 
+def cmd_setup() -> None:
+    """Write model catalog and defaults into kilo.json."""
+    port = int(os.environ.get("KSC_PORT", str(DEFAULT_PORT)))
+    write_models_to_kilo(port)
+    ok(f"wrote {len(CORTEX_MODELS)} models to kilo.json")
+    ok(f"default model: {DEFAULT_MODEL}")
+    ok(f"small model:   {DEFAULT_SMALL_MODEL}")
+    ok(f"proxy URL:     http://127.0.0.1:{port}/v1")
+
+    if not PROFILES_FILE.exists() or not load_profiles().get("profiles"):
+        print(f"\n  Next: ksc add <name>  (create an auth profile)")
+    else:
+        data = load_profiles()
+        default = data.get("default", next(iter(data.get("profiles", {})), None))
+        print(f"\n  Next: ksc {default}")
+
+
 def cmd_status() -> None:
     port = int(os.environ.get("KSC_PORT", str(DEFAULT_PORT)))
     if is_healthy(port):
@@ -436,7 +591,6 @@ def cmd_start(profile_name: Optional[str],
 
 
 def _get_running_health(port: int) -> Optional[Dict[str, Any]]:
-    """Return health JSON from a running proxy, or None."""
     try:
         import urllib.request
         resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3)
@@ -459,14 +613,12 @@ def cmd_launch(profile_name: Optional[str], kilo_args: List[str],
     print(f"\n{BOLD}ksc{RESET} {CYAN}{pname}{RESET}  "
           f"{DIM}{auth_type} @ {account}{RESET}\n")
 
-    # Check if there's already a healthy proxy matching this profile
     started_proxy = False
     health = _get_running_health(port)
     if health and not force_reauth:
         running_type = health.get("auth_type", "")
         running_account = health.get("account", "")
         expires_in = health.get("expires_in")
-        # Reuse if same account and auth type, and token isn't about to expire
         if (running_account == account
                 and running_type == auth_type
                 and (expires_in is None or expires_in > 60)):
@@ -483,7 +635,7 @@ def cmd_launch(profile_name: Optional[str], kilo_args: List[str],
             if expires_in is not None and expires_in <= 60:
                 reason.append(f"token expiring ({expires_in}s)")
             info(f"restarting proxy: {', '.join(reason)}")
-            health = None  # fall through to start
+            health = None
 
     if force_reauth:
         info("--force-reauth: restarting proxy")
@@ -491,7 +643,6 @@ def cmd_launch(profile_name: Optional[str], kilo_args: List[str],
         health = None
 
     if not health:
-        # Write profile into kilo.json and start proxy
         info("writing auth config to kilo.json")
         write_profile_to_kilo(profile, port)
         info(f"starting proxy on port {port}")
@@ -499,10 +650,8 @@ def cmd_launch(profile_name: Optional[str], kilo_args: List[str],
         ok(f"proxy up (PID {pid})")
         started_proxy = True
     else:
-        # Ensure kilo.json points at the running proxy
         write_profile_to_kilo(profile, port)
 
-    # Find kilo
     kilo_bin = _find_kilo()
     if not kilo_bin:
         ok("proxy is running — install Kilo then run: kilo")
@@ -510,7 +659,6 @@ def cmd_launch(profile_name: Optional[str], kilo_args: List[str],
         print(f"  Stop:     ksc stop\n")
         return
 
-    # Launch kilo
     ok(f"launching kilo")
     print()
 
@@ -531,21 +679,18 @@ def cmd_launch(profile_name: Optional[str], kilo_args: List[str],
 # =========================================================================
 
 def _get_setting(key: str) -> Optional[str]:
-    """Read a setting from the profiles file's top-level 'settings' object."""
     data = load_profiles()
     return data.get("settings", {}).get(key)
 
 
 def _set_setting(key: str, value: Any) -> None:
-    """Write a setting to the profiles file."""
     data = load_profiles()
     data.setdefault("settings", {})[key] = value
     save_profiles(data)
 
 
 def _handle_proxy_on_exit() -> None:
-    """Decide whether to stop the proxy when kilo exits."""
-    pref = _get_setting("on_exit")  # "stop", "keep", or None (ask)
+    pref = _get_setting("on_exit")
 
     if pref == "keep":
         info("kilo exited, proxy still running (on_exit=keep)")
@@ -556,7 +701,6 @@ def _handle_proxy_on_exit() -> None:
         stop_proxy(quiet=True)
         return
 
-    # No preference set — ask
     print()
     try:
         answer = input(
@@ -579,6 +723,7 @@ def _handle_proxy_on_exit() -> None:
     else:
         stop_proxy(quiet=True)
 
+
 def _prompt(label: str, default: str) -> str:
     if default:
         val = input(f"  {label} [{default}]: ").strip()
@@ -589,11 +734,17 @@ def _prompt(label: str, default: str) -> str:
 
 
 def _find_kilo() -> Optional[str]:
-    kilo_home = Path.home() / ".kilo" / "bin" / "kilo"
-    if kilo_home.exists() and os.access(str(kilo_home), os.X_OK):
-        return str(kilo_home)
     from shutil import which
-    return which("kilo")
+    if IS_WINDOWS:
+        kilo_home = Path.home() / ".kilo" / "bin" / "kilo.exe"
+        if kilo_home.exists():
+            return str(kilo_home)
+        return which("kilo") or which("kilo.exe")
+    else:
+        kilo_home = Path.home() / ".kilo" / "bin" / "kilo"
+        if kilo_home.exists() and os.access(str(kilo_home), os.X_OK):
+            return str(kilo_home)
+        return which("kilo")
 
 
 def ok(msg: str) -> None:
@@ -617,7 +768,7 @@ def die(msg: str) -> None:
 def main() -> None:
     args = sys.argv[1:]
 
-    if not args or args[0] == "--help" or args[0] == "-h":
+    if not args or args[0] in ("--help", "-h"):
         print(__doc__)
         return
 
@@ -644,8 +795,9 @@ def main() -> None:
         if len(args) < 2:
             die("Usage: ksc default <name>")
         cmd_default(args[1])
+    elif cmd == "setup":
+        cmd_setup()
     elif cmd == "start":
-        # ksc start [profile] [--persist-refresh-token] [--force-reauth]
         rest = args[1:]
         profile_name = rest[0] if rest and not rest[0].startswith("--") else None
         persist = "--persist-refresh-token" in rest
@@ -655,8 +807,9 @@ def main() -> None:
         cmd_status()
     elif cmd == "stop":
         cmd_stop()
+    elif cmd == "version":
+        print(f"ksc {VERSION}")
     else:
-        # ksc <profile> [-- <kilo args>]
         profile_name = cmd
         kilo_args: List[str] = []
         persist = False

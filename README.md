@@ -19,10 +19,28 @@ Kilo  -->  proxy  -->  Snowflake Cortex
            injects auth token
 ```
 
-## Requirements
+## Install
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/sfc-gh-kkeller/kilo-snowflake-cortex/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/sfc-gh-kkeller/kilo-snowflake-cortex/main/install.ps1 | iex
+```
+
+The installer:
+1. Checks for Python 3.9+ (required)
+2. Installs [Kilo Code CLI](https://kilocode.ai) if not already present
+3. Downloads ksc and the auth proxy
+4. Configures all available Cortex models in kilo.json
+5. Prompts you to create your first auth profile
+
+### Requirements
 
 - Python 3.9+
-- [Kilo Code CLI](https://kilocode.ai) -- `npm install -g @kilocode/cli`
 - A Snowflake account with Cortex enabled
 - A Snowflake **programmatic access token (PAT)**, keypair, or OAuth credentials
 - `pip install PyJWT cryptography` (only for keypair or OAuth auth)
@@ -30,32 +48,12 @@ Kilo  -->  proxy  -->  Snowflake Cortex
 ## Quick start
 
 ```bash
-git clone https://github.com/sfc-gh-kkeller/kilo-snowflake-cortex.git
-cd kilo-snowflake-cortex
-
-# Install ksc onto PATH
-./install-ksc.sh
-
-# Add your first profile
+# Add your Snowflake credentials
 ksc add myaccount
 
-# Launch
+# Launch Kilo with Snowflake Cortex
 ksc myaccount
 ```
-
-`ksc add` prompts for account, user, auth type, and credentials. Profiles are stored in `~/.config/kilo/ksc-profiles.json`.
-
-### Legacy setup (without ksc)
-
-```bash
-# macOS / Linux
-./run.sh
-
-# Windows
-run.bat
-```
-
-On first run, `setup.sh` will prompt for your Snowflake account, user, and PAT, then generate `~/.config/kilo/kilo.json`.
 
 ## ksc CLI
 
@@ -67,8 +65,11 @@ ksc list                         # list profiles
 ksc add <name>                   # add profile interactively
 ksc remove <name>                # remove profile
 ksc default <name>               # set default profile
+ksc setup                        # write model catalog to kilo.json
+ksc start <profile>              # start proxy only (no kilo)
 ksc status                       # show proxy health
 ksc stop                         # stop running proxy
+ksc version                      # show version
 ```
 
 ### Profile examples
@@ -121,7 +122,8 @@ ksc myprofile --persist-refresh-token
 | Variable | Default | Description |
 |---|---|---|
 | `KSC_PORT` | `8080` | Proxy listen port |
-| `XDG_CONFIG_HOME` | `~/.config` | Config directory |
+| `KSC_INSTALL_DIR` | `~/.local/share/kilo-snowflake-cortex` | Install directory (macOS/Linux) |
+| `KSC_BIN_DIR` | `~/.local/bin` | Binary directory (macOS/Linux) |
 
 ## Authentication
 
@@ -192,8 +194,10 @@ proxy/ksc.py                    ksc launcher (profiles + proxy + kilo)
 proxy/snowflake-auth-sidecar.py auth token manager and lightweight proxy
 proxy/snowflake-cortex-proxy.py translating proxy for Cortex Agent API (advanced)
 test/idp.py                     throwaway OIDC IdP for testing device code flow
-install-ksc.sh                  symlink ksc onto PATH
+install.sh                      one-liner installer (macOS/Linux)
+install.ps1                     one-liner installer (Windows)
+install-ksc.sh                  manual symlink helper
 run.sh / run.bat                legacy launch scripts
-setup.sh / setup.bat            generate kilo.json interactively
+setup.sh / setup.bat            legacy setup scripts
 LICENSE                         MIT
 ```
