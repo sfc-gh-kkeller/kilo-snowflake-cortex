@@ -207,6 +207,14 @@ python3 proxy/snowflake-cortex-proxy.py
 
 This is only needed if you want Snowflake to orchestrate tools server-side. For most use cases, the native OpenAI API with client-side MCP is sufficient.
 
+## Disclaimer
+
+This is a personal project by [Kevin Keller](https://github.com/sfc-gh-kkeller). It is **not** an official Snowflake product and is not supported, endorsed, or guaranteed by Snowflake in any way. Use at your own risk.
+
+This code is intended as **inspiration** to help reduce friction between Kilo Code and Snowflake Cortex. It is not intended for production use without your own security review, hardening, and penetration testing. Treat it as a starting point for building your own solution.
+
+Licensed under the [MIT License](LICENSE).
+
 ## Layout
 
 ```
