@@ -1,12 +1,22 @@
 # Kilo x Snowflake Cortex
 
-Run [Kilo Code](https://kilocode.ai) against **Snowflake Cortex** models -- Claude Opus 5, Sonnet 5, GPT 5.4 -- with full agentic tool calling.
+Use [Kilo Code](https://kilocode.ai) with **Snowflake Cortex** models -- Claude Opus 5, Sonnet 5, GPT 5.4 -- with full agentic tool calling. Your code and prompts stay inside your Snowflake perimeter. No third-party model API keys required.
 
-Your code and prompts stay inside your Snowflake perimeter. No third-party model API keys required.
+## Why
+
+Connecting Kilo to Snowflake Cortex today means manually wiring up authentication, figuring out which API endpoint and provider config to use, translating incompatible request parameters, and refreshing tokens before they expire. That's a lot of friction before you can write your first prompt.
+
+**`ksc`** eliminates that friction:
+
+- **One-liner install** -- downloads everything, installs Kilo if needed, configures all available Cortex models
+- **Named auth profiles** -- store PAT, keypair, OAuth, or SSO device code credentials once, switch between accounts/roles with `ksc <profile>`
+- **Automatic token lifecycle** -- mints, refreshes, and injects tokens so you never hit an expired-credential error mid-session
+- **Zero-config proxy** -- transparently fixes `max_tokens` vs `max_completion_tokens` incompatibilities and handles streaming, so Kilo just works
+- **Cross-platform** -- macOS, Linux, Windows
 
 ## How it works
 
-Snowflake Cortex natively supports the **OpenAI Chat Completions API** at `/api/v2/cortex/v1/chat/completions`. The **`ksc` launcher** manages auth profiles, starts a lightweight proxy (fixes `max_tokens` compatibility), and launches Kilo in one command:
+Snowflake Cortex natively supports the **OpenAI Chat Completions API** at `/api/v2/cortex/v1/chat/completions`. The `ksc` launcher loads your auth profile, starts a lightweight local proxy that handles authentication and parameter translation, and launches Kilo -- all in one command:
 
 ```
 ksc <profile>
