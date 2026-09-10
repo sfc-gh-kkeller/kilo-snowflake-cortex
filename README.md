@@ -85,10 +85,13 @@ ksc list                         # list profiles
 ksc add <name>                   # add profile interactively
 ksc remove <name>                # remove profile
 ksc default <name>               # set default profile
-ksc setup                        # write model catalog to kilo.json
+ksc setup                        # write model catalog + MCP to kilo.json
 ksc start <profile>              # start proxy only (no kilo)
 ksc status                       # show proxy health
 ksc stop                         # stop running proxy
+ksc add-mcp <name>               # add MCP server connection
+ksc remove-mcp <name>            # remove MCP server connection
+ksc list-mcp                     # list MCP server connections
 ksc version                      # show version
 ```
 
@@ -182,19 +185,50 @@ Available models (depends on account/region):
 
 ## Querying Snowflake data via MCP
 
-The auth sidecar handles **inference credentials**. To give Kilo the ability to **query Snowflake data**, register a Snowflake managed MCP server in `kilo.json`:
+The auth proxy handles both **inference credentials** and **MCP data access**. Configure Snowflake managed MCP servers with `ksc add-mcp` and the proxy will inject auth tokens automatically.
 
-```json
-{
-  "mcp": {
-    "snowflake": {
-      "type": "local",
-      "command": ["your-mcp-server", "--args"],
-      "enabled": true,
-      "timeout": 60000
-    }
-  }
-}
+### Managed MCP server (recommended)
+
+The proxy authenticates and forwards JSON-RPC requests to the Snowflake-managed MCP server:
+
+```bash
+# Add a managed MCP server connection
+ksc add-mcp my-data
+#  Type: managed
+#  Auth profile: pat1
+#  URL: https://ACCT.snowflakecomputing.com/api/v2/databases/DB/schemas/SCH/mcp-servers/MY_MCP
+
+# Update kilo.json with the MCP entry
+ksc setup
+```
+
+After `ksc setup`, Kilo sees the MCP server at `http://127.0.0.1:8080/mcp/my-data` and calls it transparently. Each MCP server can use a different auth profile (different account, role, or auth type).
+
+```
+Kilo  -->  proxy /mcp/my-data  -->  Snowflake managed MCP server
+           injects Bearer token       (tools/list, tools/call)
+           from "pat1" profile
+```
+
+### Community MCP server
+
+For the community `snowflake-labs-mcp` (stdio transport), ksc populates CLI args from the profile:
+
+```bash
+ksc add-mcp local-data
+#  Type: community
+#  Auth profile: pat1
+#  Service config: ~/.config/kilo/mcp-services.yaml
+
+ksc setup   # writes command array into kilo.json
+```
+
+### MCP CLI commands
+
+```bash
+ksc add-mcp <name>       # add MCP server connection
+ksc remove-mcp <name>    # remove MCP server connection
+ksc list-mcp             # list configured MCP servers
 ```
 
 ## Translating proxy (advanced)

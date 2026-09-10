@@ -7,6 +7,9 @@ so Kilo Code can call Snowflake's native OpenAI-compatible API directly.
 Supports: PAT, keypair JWT, Snowflake OAuth (authorization code + PKCE),
 external OAuth (device code flow).
 
+Also proxies Snowflake managed MCP server connections, injecting auth
+tokens for each configured MCP server.
+
 Usage:
     python3 snowflake-auth-sidecar.py              # auth sidecar (default)
     python3 snowflake-auth-sidecar.py --once        # authenticate once and exit
@@ -660,12 +663,133 @@ class AuthSidecar:
 
 
 # =========================================================================
+# Multi-session auth manager (for MCP proxy)
+# =========================================================================
+
+class AuthSession:
+    """Manages token lifecycle for a single auth profile."""
+
+    def __init__(self, profile_name: str, config: Dict[str, Any],
+                 state: AuthStateManager):
+        self.profile_name = profile_name
+        self.config = config
+        self.state = state
+        self.current: Optional[AuthResult] = None
+        self.account = config["account"]
+        self.auth_type = config.get("auth", {}).get("type", "pat")
+        self._lock = threading.Lock()
+
+    def do_auth(self) -> AuthResult:
+        result = authenticate(self.config, self.state)
+        with self._lock:
+            self.current = result
+        return result
+
+    def get_token(self) -> Optional[AuthResult]:
+        with self._lock:
+            return self.current
+
+    def refresh_interval(self) -> float:
+        if self.auth_type == "pat":
+            return 3600 * 24
+        if self.auth_type == "privatekey":
+            return KEYPAIR_RENEWAL_INTERVAL
+        cur = self.get_token()
+        if cur and cur.expires_at:
+            remaining = cur.expires_at - time.time() - DEFAULT_REFRESH_MARGIN
+            return max(remaining, 30)
+        return 2400
+
+
+class AuthSessionManager:
+    """Manages multiple concurrent auth sessions for different profiles."""
+
+    def __init__(self):
+        self.sessions: Dict[str, AuthSession] = {}
+        self._threads: list = []
+        self._stop = threading.Event()
+
+    def add_session(self, profile_name: str, config: Dict[str, Any],
+                    state: AuthStateManager) -> AuthSession:
+        if profile_name in self.sessions:
+            return self.sessions[profile_name]
+        session = AuthSession(profile_name, config, state)
+        self.sessions[profile_name] = session
+        return session
+
+    def start_all(self) -> None:
+        """Authenticate all sessions and start refresh threads."""
+        for name, session in self.sessions.items():
+            try:
+                result = session.do_auth()
+                exp_str = ""
+                if result.expires_at:
+                    remaining = int(result.expires_at - time.time())
+                    exp_str = f", expires in {remaining}s"
+                print(f"{GREEN}ok{RESET} [{name}] Authenticated "
+                      f"({session.auth_type}{exp_str})", file=sys.stderr)
+            except Exception as e:
+                print(f"{RED}!{RESET} [{name}] Auth failed: {e}", file=sys.stderr)
+
+            t = threading.Thread(target=self._refresh_loop, args=(session,),
+                                 daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def _refresh_loop(self, session: AuthSession) -> None:
+        while not self._stop.is_set():
+            wait = session.refresh_interval()
+            if self._stop.wait(timeout=wait):
+                break
+            try:
+                result = session.do_auth()
+                exp_str = ""
+                if result.expires_at:
+                    remaining = int(result.expires_at - time.time())
+                    exp_str = f", expires in {remaining}s"
+                print(f"{GREEN}ok{RESET} [{session.profile_name}] Refreshed "
+                      f"({session.auth_type}{exp_str})", file=sys.stderr)
+            except Exception as e:
+                print(f"{RED}!{RESET} [{session.profile_name}] Refresh failed: {e}",
+                      file=sys.stderr)
+                self._stop.wait(timeout=60)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+# =========================================================================
+# MCP server registry (maps MCP names to auth sessions + upstream URLs)
+# =========================================================================
+
+class McpRegistry:
+    """Maps MCP server names to upstream URLs and auth sessions."""
+
+    def __init__(self):
+        self.entries: Dict[str, Dict[str, Any]] = {}
+
+    def add(self, name: str, upstream_url: str, session: AuthSession) -> None:
+        self.entries[name] = {
+            "url": upstream_url,
+            "session": session,
+        }
+
+    def get(self, name: str) -> Optional[Dict[str, Any]]:
+        return self.entries.get(name)
+
+    def names(self) -> list:
+        return list(self.entries.keys())
+
+
+# =========================================================================
 # Lightweight proxy (fixes max_tokens -> max_completion_tokens)
 # =========================================================================
 
 class ProxyHandler(BaseHTTPRequestHandler):
-    """Thin proxy: auth injection + parameter fixing for Snowflake Cortex."""
+    """Thin proxy: auth injection + parameter fixing for Snowflake Cortex.
+    Also handles MCP proxy routes at /mcp/<name>."""
     sidecar: Optional[AuthSidecar] = None
+    mcp_registry: Optional[McpRegistry] = None
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):
@@ -683,6 +807,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if sc and sc.current and sc.current.expires_at else None,
                 "mode": "proxy",
             }
+            # Add MCP status
+            reg = self.mcp_registry
+            if reg and reg.entries:
+                mcp_status = {}
+                for name, entry in reg.entries.items():
+                    sess = entry["session"]
+                    tok = sess.get_token()
+                    mcp_status[name] = {
+                        "profile": sess.profile_name,
+                        "auth_type": sess.auth_type,
+                        "account": sess.account,
+                        "has_token": tok is not None,
+                        "expires_in": int(tok.expires_at - time.time())
+                            if tok and tok.expires_at else None,
+                    }
+                status["mcp_servers"] = mcp_status
             self._json_response(200, status)
         elif self.path == "/v1/models":
             self._proxy_get()
@@ -690,6 +830,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        # MCP proxy routes: /mcp/<name>
+        if self.path.startswith("/mcp/"):
+            self._proxy_mcp()
+            return
+
         sc = self.sidecar
         if not sc or not sc.current:
             self._json_response(503, {"error": "not authenticated yet"})
@@ -762,6 +907,91 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(body_bytes)
         except Exception as e:
             self._json_response(502, {"error": str(e)})
+
+    def _proxy_mcp(self):
+        """Proxy a JSON-RPC request to a Snowflake managed MCP server."""
+        reg = self.mcp_registry
+        if not reg:
+            self._json_response(503, {"error": "no MCP servers configured"})
+            return
+
+        # Parse /mcp/<name> or /mcp/<name>/extra/path
+        parts = self.path.split("/", 3)  # ['', 'mcp', '<name>', ...]
+        if len(parts) < 3:
+            self._json_response(404, {"error": "missing MCP server name"})
+            return
+        mcp_name = parts[2]
+
+        entry = reg.get(mcp_name)
+        if not entry:
+            available = ", ".join(reg.names()) or "(none)"
+            self._json_response(404, {
+                "error": f"MCP server '{mcp_name}' not found",
+                "available": available,
+            })
+            return
+
+        session: AuthSession = entry["session"]
+        upstream_url = entry["url"]
+        token_result = session.get_token()
+        if not token_result:
+            self._json_response(503, {
+                "error": f"MCP server '{mcp_name}': not authenticated yet",
+            })
+            return
+
+        # Read request body
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length)
+
+        # Forward to upstream with auth
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "Authorization": f"Bearer {token_result.token}",
+        }
+        if token_result.token_type:
+            headers["X-Snowflake-Authorization-Token-Type"] = token_result.token_type
+
+        req = urllib.request.Request(
+            upstream_url, data=raw, headers=headers, method="POST",
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=600)
+            content_type = resp.headers.get("Content-Type", "application/json")
+            is_stream = "event-stream" in content_type
+
+            self.send_response(resp.status)
+            self.send_header("Content-Type", content_type)
+
+            if is_stream:
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                while True:
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        break
+                    self.wfile.write(f"{len(chunk):x}\r\n".encode())
+                    self.wfile.write(chunk)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            else:
+                full_body = resp.read()
+                self.send_header("Content-Length", str(len(full_body)))
+                self.end_headers()
+                self.wfile.write(full_body)
+
+        except urllib.error.HTTPError as e:
+            body_bytes = e.read()
+            self.send_response(e.code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body_bytes)
+        except Exception as e:
+            self._json_response(502, {"error": f"MCP proxy error: {e}"})
 
     def _proxy_get(self):
         sc = self.sidecar
@@ -916,7 +1146,7 @@ def main():
         sidecar.current = result
         sidecar._log_token(result, "Authenticated")
 
-        # Start background auth refresh
+        # Start background auth refresh for the main (Cortex inference) session
         def refresh_loop():
             while not sidecar._stop.is_set():
                 wait = sidecar.refresh_interval()
@@ -934,10 +1164,51 @@ def main():
         rt = threading.Thread(target=refresh_loop, daemon=True)
         rt.start()
 
+        # Initialize MCP proxy sessions from ksc-profiles.json
+        mcp_registry = McpRegistry()
+        session_mgr = AuthSessionManager()
+        profiles_file = config_path.parent / "ksc-profiles.json"
+        if profiles_file.exists():
+            try:
+                with open(profiles_file) as f:
+                    profiles_data = json.load(f)
+                mcp_servers = profiles_data.get("mcp_servers", {})
+                profiles = profiles_data.get("profiles", {})
+                for mcp_name, mcp_cfg in mcp_servers.items():
+                    if mcp_cfg.get("type") != "managed":
+                        continue
+                    profile_name = mcp_cfg.get("profile")
+                    upstream_url = mcp_cfg.get("url")
+                    if not profile_name or not upstream_url:
+                        continue
+                    profile_cfg = profiles.get(profile_name)
+                    if not profile_cfg:
+                        print(f"{YELLOW}!{RESET} MCP '{mcp_name}': "
+                              f"profile '{profile_name}' not found, skipping",
+                              file=sys.stderr)
+                        continue
+                    mcp_state = InMemoryAuthStateManager()
+                    session = session_mgr.add_session(
+                        profile_name, profile_cfg, mcp_state,
+                    )
+                    mcp_registry.add(mcp_name, upstream_url, session)
+                    print(f"  MCP: {mcp_name} -> {profile_name} "
+                          f"-> {upstream_url[:60]}...", file=sys.stderr)
+
+                if session_mgr.sessions:
+                    session_mgr.start_all()
+            except Exception as e:
+                print(f"{YELLOW}!{RESET} Failed to load MCP config: {e}",
+                      file=sys.stderr)
+
         ProxyHandler.sidecar = sidecar
+        ProxyHandler.mcp_registry = mcp_registry
         proxy_server = ThreadingHTTPServer(("127.0.0.1", args.proxy_port), ProxyHandler)
         print(f"\n  Proxy:    http://127.0.0.1:{args.proxy_port}/v1", file=sys.stderr)
         print(f"  Target:   {sidecar.base_url}", file=sys.stderr)
+        if mcp_registry.entries:
+            print(f"  MCP:      {len(mcp_registry.entries)} server(s) at "
+                  f"/mcp/<name>", file=sys.stderr)
         print(f"\n  Point Kilo at: http://127.0.0.1:{args.proxy_port}/v1", file=sys.stderr)
         print(f"  {YELLOW}Press Ctrl+C to stop{RESET}\n", file=sys.stderr)
 
@@ -946,6 +1217,7 @@ def main():
         except KeyboardInterrupt:
             print(f"\n{YELLOW}Stopping{RESET}", file=sys.stderr)
             sidecar.stop()
+            session_mgr.stop()
         return
 
     try:

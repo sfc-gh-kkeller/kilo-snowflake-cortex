@@ -16,6 +16,10 @@ Manages named auth profiles and launches Kilo with a running proxy.
     ksc stop                  # stop running proxy
     ksc version               # show version
 
+    ksc add-mcp <name>        # add MCP server connection
+    ksc remove-mcp <name>     # remove MCP server connection
+    ksc list-mcp              # list MCP server connections
+
     ksc <profile> --force-reauth   # force full re-authentication
 """
 from __future__ import annotations
@@ -29,7 +33,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 IS_WINDOWS = sys.platform == "win32"
 
 # -- ANSI (disabled on Windows unless WT/modern terminal) --
@@ -245,6 +249,64 @@ def write_models_to_kilo(port: int = DEFAULT_PORT) -> None:
     oc["models"] = CORTEX_MODELS
 
     _write_kilo_config(cfg)
+
+
+def write_mcp_to_kilo(mcp_servers: Dict[str, Any], port: int = DEFAULT_PORT) -> None:
+    """Write MCP server entries into kilo.json."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    cfg: Dict[str, Any] = {}
+    if KILO_CONFIG.exists():
+        with open(KILO_CONFIG) as f:
+            cfg = json.load(f)
+
+    data = load_profiles()
+    profiles = data.get("profiles", {})
+    mcp = cfg.setdefault("mcp", {})
+
+    for name, srv in mcp_servers.items():
+        mtype = srv.get("type", "managed")
+        profile_name = srv.get("profile")
+        profile = profiles.get(profile_name, {}) if profile_name else {}
+
+        if mtype == "managed":
+            mcp[name] = {
+                "type": "url",
+                "url": f"http://127.0.0.1:{port}/mcp/{name}",
+                "enabled": True,
+                "timeout": 120000,
+            }
+        elif mtype == "community":
+            command = _build_community_mcp_command(profile, srv)
+            mcp[name] = {
+                "type": "local",
+                "command": command,
+                "enabled": True,
+                "timeout": 60000,
+            }
+
+    _write_kilo_config(cfg)
+
+
+def _build_community_mcp_command(profile: Dict[str, Any],
+                                  srv: Dict[str, Any]) -> List[str]:
+    """Build the CLI args for the community snowflake-labs-mcp server."""
+    cmd = ["uvx", "snowflake-labs-mcp"]
+    if profile.get("account"):
+        cmd += ["--account", profile["account"]]
+    if profile.get("user"):
+        cmd += ["--user", profile["user"]]
+    auth = profile.get("auth", {})
+    if auth.get("type") == "pat" and auth.get("pat"):
+        cmd += ["--pat", auth["pat"]]
+    if profile.get("role"):
+        cmd += ["--role", profile["role"]]
+    if profile.get("warehouse"):
+        cmd += ["--warehouse", profile["warehouse"]]
+    svc_config = srv.get("service_config")
+    if svc_config:
+        cmd += ["--service-config-file", str(Path(svc_config).expanduser())]
+    return cmd
 
 
 def _write_kilo_config(cfg: Dict[str, Any]) -> None:
@@ -516,7 +578,7 @@ def cmd_default(name: str) -> None:
 
 
 def cmd_setup() -> None:
-    """Write model catalog and defaults into kilo.json."""
+    """Write model catalog, MCP entries, and defaults into kilo.json."""
     port = int(os.environ.get("KSC_PORT", str(DEFAULT_PORT)))
     write_models_to_kilo(port)
     ok(f"wrote {len(CORTEX_MODELS)} models to kilo.json")
@@ -524,10 +586,16 @@ def cmd_setup() -> None:
     ok(f"small model:   {DEFAULT_SMALL_MODEL}")
     ok(f"proxy URL:     http://127.0.0.1:{port}/v1")
 
-    if not PROFILES_FILE.exists() or not load_profiles().get("profiles"):
+    # Write MCP entries
+    data = load_profiles()
+    mcp_servers = data.get("mcp_servers", {})
+    if mcp_servers:
+        write_mcp_to_kilo(mcp_servers, port)
+        ok(f"wrote {len(mcp_servers)} MCP server(s) to kilo.json")
+
+    if not PROFILES_FILE.exists() or not data.get("profiles"):
         print(f"\n  Next: ksc add <name>  (create an auth profile)")
     else:
-        data = load_profiles()
         default = data.get("default", next(iter(data.get("profiles", {})), None))
         print(f"\n  Next: ksc {default}")
 
@@ -551,6 +619,95 @@ def cmd_status() -> None:
 
 def cmd_stop() -> None:
     stop_proxy()
+
+
+# =========================================================================
+# MCP server management
+# =========================================================================
+
+def cmd_add_mcp(name: str) -> None:
+    data = load_profiles()
+    mcp_servers = data.setdefault("mcp_servers", {})
+    profiles = data.get("profiles", {})
+
+    if name in mcp_servers:
+        die(f"MCP server '{name}' already exists. Remove it first: ksc remove-mcp {name}")
+
+    print(f"\n{BOLD}{BLUE}Add MCP server: {name}{RESET}\n")
+
+    mcp_type = _prompt("Type (managed/community)", "managed")
+    if mcp_type not in ("managed", "community"):
+        die(f"Unknown type: {mcp_type}. Use 'managed' or 'community'")
+
+    # Pick auth profile
+    if not profiles:
+        die("No auth profiles. Run: ksc add <name>")
+    profile_names = list(profiles.keys())
+    default_profile = data.get("default") or profile_names[0]
+    profile = _prompt(f"Auth profile ({', '.join(profile_names)})", default_profile)
+    if profile not in profiles:
+        die(f"Profile '{profile}' not found")
+
+    entry: Dict[str, Any] = {"type": mcp_type, "profile": profile}
+
+    if mcp_type == "managed":
+        account = profiles[profile]["account"]
+        default_base = f"https://{account}.snowflakecomputing.com"
+        print(f"\n  {DIM}URL format: https://<account>.snowflakecomputing.com"
+              f"/api/v2/databases/<DB>/schemas/<SCHEMA>/mcp-servers/<NAME>{RESET}")
+        url = _prompt("MCP server URL", "")
+        if not url:
+            db = _prompt("Database", "")
+            schema = _prompt("Schema", "")
+            server = _prompt("MCP server name", "")
+            url = f"{default_base}/api/v2/databases/{db}/schemas/{schema}/mcp-servers/{server}"
+        entry["url"] = url
+
+    elif mcp_type == "community":
+        entry["service_config"] = _prompt(
+            "Service config YAML path",
+            str(CONFIG_DIR / "mcp-services.yaml"),
+        )
+
+    mcp_servers[name] = entry
+    save_profiles(data)
+    ok(f"MCP server '{name}' saved (type={mcp_type}, profile={profile})")
+    print(f"  {DIM}Run 'ksc setup' to update kilo.json{RESET}")
+
+
+def cmd_remove_mcp(name: str) -> None:
+    data = load_profiles()
+    mcp_servers = data.get("mcp_servers", {})
+    if name not in mcp_servers:
+        die(f"MCP server '{name}' not found")
+    del mcp_servers[name]
+    save_profiles(data)
+    ok(f"MCP server '{name}' removed")
+    print(f"  {DIM}Run 'ksc setup' to update kilo.json{RESET}")
+
+
+def cmd_list_mcp() -> None:
+    data = load_profiles()
+    mcp_servers = data.get("mcp_servers", {})
+
+    if not mcp_servers:
+        print("No MCP servers configured. Run: ksc add-mcp <name>")
+        return
+
+    port = int(os.environ.get("KSC_PORT", str(DEFAULT_PORT)))
+    for name, cfg in mcp_servers.items():
+        mtype = cfg.get("type", "?")
+        profile = cfg.get("profile", "?")
+        if mtype == "managed":
+            url = cfg.get("url", "?")
+            proxy_url = f"http://127.0.0.1:{port}/mcp/{name}"
+            print(f"  {BOLD}{name}{RESET}  {DIM}managed, profile={profile}{RESET}")
+            print(f"    upstream: {url}")
+            print(f"    proxy:    {proxy_url}")
+        else:
+            svc = cfg.get("service_config", "?")
+            print(f"  {BOLD}{name}{RESET}  {DIM}community, profile={profile}{RESET}")
+            print(f"    service config: {svc}")
 
 
 def cmd_start(profile_name: Optional[str],
@@ -795,6 +952,16 @@ def main() -> None:
         if len(args) < 2:
             die("Usage: ksc default <name>")
         cmd_default(args[1])
+    elif cmd == "add-mcp":
+        if len(args) < 2:
+            die("Usage: ksc add-mcp <name>")
+        cmd_add_mcp(args[1])
+    elif cmd == "remove-mcp":
+        if len(args) < 2:
+            die("Usage: ksc remove-mcp <name>")
+        cmd_remove_mcp(args[1])
+    elif cmd == "list-mcp":
+        cmd_list_mcp()
     elif cmd == "setup":
         cmd_setup()
     elif cmd == "start":
