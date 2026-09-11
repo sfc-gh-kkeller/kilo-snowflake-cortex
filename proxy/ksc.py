@@ -73,64 +73,12 @@ DEFAULT_PORT = 8080
 # =========================================================================
 # Model catalog — available Cortex models for kilo.json
 # =========================================================================
+# Single source of truth lives in cortex_models.py, shared with
+# snowflake-cortex-proxy.py so the two can't drift apart.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cortex_models import kilo_models_block  # noqa: E402
 
-CORTEX_MODELS = {
-    "claude-opus-5": {
-        "name": "Snowflake Cortex | Claude Opus 5",
-        "tool_call": True,
-        "limit": {"context": 1000000, "output": 128000},
-    },
-    "claude-opus-4-8": {
-        "name": "Snowflake Cortex | Claude Opus 4.8",
-        "tool_call": True,
-        "limit": {"context": 1000000, "output": 128000},
-    },
-    "claude-opus-4-7": {
-        "name": "Snowflake Cortex | Claude Opus 4.7",
-        "tool_call": True,
-        "limit": {"context": 1000000, "output": 128000},
-    },
-    "claude-opus-4-6": {
-        "name": "Snowflake Cortex | Claude Opus 4.6",
-        "tool_call": True,
-        "limit": {"context": 1000000, "output": 128000},
-    },
-    "claude-sonnet-5": {
-        "name": "Snowflake Cortex | Claude Sonnet 5",
-        "tool_call": True,
-        "limit": {"context": 1000000, "output": 64000},
-    },
-    "claude-sonnet-4-6": {
-        "name": "Snowflake Cortex | Claude Sonnet 4.6",
-        "tool_call": True,
-        "limit": {"context": 1000000, "output": 64000},
-    },
-    "claude-opus-4-5": {
-        "name": "Snowflake Cortex | Claude Opus 4.5",
-        "tool_call": True,
-        "limit": {"context": 200000, "output": 64000},
-    },
-    "claude-sonnet-4-5": {
-        "name": "Snowflake Cortex | Claude Sonnet 4.5",
-        "tool_call": True,
-        "limit": {"context": 200000, "output": 64000},
-    },
-    "claude-haiku-4-5": {
-        "name": "Snowflake Cortex | Claude Haiku 4.5",
-        "tool_call": True,
-        "limit": {"context": 200000, "output": 64000},
-    },
-    "openai-gpt-5.4": {
-        "name": "Snowflake Cortex | OpenAI GPT 5.4",
-        "tool_call": True,
-        "limit": {"context": 400000, "output": 128000},
-    },
-    "openai-gpt-5.2": {
-        "name": "Snowflake Cortex | OpenAI GPT 5.2",
-        "tool_call": True,
-        "limit": {"context": 272000, "output": 8192},
-    },
-}
+CORTEX_MODELS = kilo_models_block()
 
 DEFAULT_MODEL = "openai-compatible/claude-opus-5"
 DEFAULT_SMALL_MODEL = "openai-compatible/claude-haiku-4-5"

@@ -4,9 +4,12 @@
 # Usage:
 #   ./install-ksc.sh                 # symlink to ~/.local/bin/ksc
 #   ./install-ksc.sh /usr/local/bin  # symlink to /usr/local/bin/ksc
+#
+# DEPRECATED: superseded by install.sh / install.ps1 at the repo root. Kept
+# here for reference only; not actively maintained.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KSC="$SCRIPT_DIR/proxy/ksc.py"
 
 TARGET_DIR="${1:-$HOME/.local/bin}"

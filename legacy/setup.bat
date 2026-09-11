@@ -5,10 +5,13 @@ setlocal enabledelayedexpansion
 ::
 ::   setup.bat                                interactive
 ::   setup.bat --account X --user Y           non-interactive (needs SNOWFLAKE_PAT env)
+::
+:: DEPRECATED: superseded by `ksc setup` (see proxy/ksc.py / install.ps1). Kept
+:: here for reference only; not actively maintained.
 
-set "SCRIPT_DIR=%~dp0"
-set "PROXY=%SCRIPT_DIR%proxy\snowflake-cortex-proxy.py"
-set "MCP_YAML=%SCRIPT_DIR%config\snowflake-mcp.yaml"
+set "SCRIPT_DIR=%~dp0.."
+set "PROXY=%SCRIPT_DIR%\proxy\snowflake-cortex-proxy.py"
+set "MCP_YAML=%SCRIPT_DIR%\config\snowflake-mcp.yaml"
 set "CONFIG_DIR=%APPDATA%\kilo"
 set "CONFIG=%CONFIG_DIR%\kilo.json"
 if not defined PROXY_PORT set "PROXY_PORT=8080"
@@ -104,7 +107,7 @@ if not exist "%CONFIG_DIR%" mkdir "%CONFIG_DIR%"
 if %errorlevel% neq 0 (
     :: Fallback: use the proxy's --print-kilo-models via a temp file
     %PY% "%PROXY%" --print-kilo-models > "%TEMP%\kilo_models.json" 2>nul
-    %PY% -c "exec(open(r'%SCRIPT_DIR%setup_helper.py').read())" 2>nul
+    %PY% -c "exec(open(r'%~dp0setup_helper.py').read())" 2>nul
 )
 
 echo.

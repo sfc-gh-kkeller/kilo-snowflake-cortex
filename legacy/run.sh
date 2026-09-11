@@ -8,7 +8,10 @@
 #
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# DEPRECATED: superseded by `ksc` (see proxy/ksc.py / install.sh). Kept here
+# for reference only; not actively maintained.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROXY="$SCRIPT_DIR/proxy/snowflake-cortex-proxy.py"
 PORT="${PROXY_PORT:-8080}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/kilo-snowflake-cortex"
@@ -167,7 +170,7 @@ fi
 
 if [[ "$needs_setup" == "1" ]]; then
   info "config missing or incomplete — running setup..."
-  "$SCRIPT_DIR/setup.sh" || { fail "setup failed"; exit 1; }
+  "$SCRIPT_DIR/legacy/setup.sh" || { fail "setup failed"; exit 1; }
 fi
 
 start_proxy || exit 1

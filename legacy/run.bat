@@ -7,9 +7,12 @@ setlocal enabledelayedexpansion
 ::   run.bat --no-kilo      start proxy only
 ::   run.bat --stop         stop the proxy
 ::   run.bat --status       show proxy health
+::
+:: DEPRECATED: superseded by ksc (see proxy/ksc.py / install.ps1). Kept here
+:: for reference only; not actively maintained.
 
-set "SCRIPT_DIR=%~dp0"
-set "PROXY=%SCRIPT_DIR%proxy\snowflake-cortex-proxy.py"
+set "SCRIPT_DIR=%~dp0.."
+set "PROXY=%SCRIPT_DIR%\proxy\snowflake-cortex-proxy.py"
 if not defined PROXY_PORT set "PROXY_PORT=8080"
 set "STATE_DIR=%LOCALAPPDATA%\kilo-snowflake-cortex"
 set "PIDFILE=%STATE_DIR%\proxy.pid"
@@ -42,7 +45,7 @@ if "%ACTION%"=="status" goto :show_status
 set "KILO_CONFIG=%APPDATA%\kilo\kilo.json"
 if not exist "%KILO_CONFIG%" (
     echo [..] config not found — running setup...
-    call "%SCRIPT_DIR%setup.bat"
+    call "%~dp0setup.bat"
     if %errorlevel% neq 0 exit /b 1
 )
 

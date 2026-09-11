@@ -6,9 +6,12 @@
 #   ./setup.sh --account X --user Y  non-interactive (needs SNOWFLAKE_PAT env)
 #
 # Safe to re-run: backs up existing config, preserves other providers/MCP servers.
+#
+# DEPRECATED: superseded by `ksc setup` (see proxy/ksc.py / install.sh). Kept
+# here for reference only; not actively maintained.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROXY="$SCRIPT_DIR/proxy/snowflake-cortex-proxy.py"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/kilo"
 CONFIG="$CONFIG_DIR/kilo.json"
