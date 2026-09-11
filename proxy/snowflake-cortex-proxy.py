@@ -1360,6 +1360,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
             args = str(arguments)
         return f"{name}::{args}"
 
+    def _check_tool_repeat(self, tool_name: str, tool_input: Any,
+                           executed_counts: Dict[str, int], emitted_sigs: set,
+                           blocked_repeats: list) -> Optional[str]:
+        """LOOP BREAKER, shared by both streaming paths.
+
+        A user may legitimately ask to re-run something, so one repeat is
+        allowed; beyond that it is a runaway re-plan (this is what turned a
+        single `find ...` into an endless cycle). Returns the call's
+        signature if it may be forwarded, recording it in ``emitted_sigs``;
+        returns None (after recording it in ``blocked_repeats``) if it's a
+        blocked repeat.
+        """
+        sig = self._tool_signature(tool_name, tool_input)
+        already = executed_counts.get(sig, 0)
+        if sig in emitted_sigs or already >= REPEAT_TOOL_LIMIT:
+            blocked_repeats.append(sig)
+            print(f"{YELLOW}!{RESET} blocked repeat tool call "
+                  f"(ran {already}x already): {sig[:160]}", file=sys.stderr)
+            return None
+        emitted_sigs.add(sig)
+        return sig
+
     @staticmethod
     def _text_of(value: Any) -> str:
         if value is None:
@@ -2095,17 +2117,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             """Emit a function_call item; returns True if it was forwarded."""
             nonlocal next_output_index, tool_calls_emitted
 
-            sig = self._tool_signature(tool_name, tool_input)
-            # LOOP BREAKER. A user may legitimately ask to re-run something, so
-            # one repeat is allowed; beyond that it is a runaway re-plan (this is
-            # what turned a single `find ...` into an endless cycle).
-            already = executed_counts.get(sig, 0)
-            if sig in emitted_sigs or already >= REPEAT_TOOL_LIMIT:
-                blocked_repeats.append(sig)
-                print(f"{YELLOW}!{RESET} blocked repeat tool call "
-                      f"(ran {already}x already): {sig[:160]}", file=sys.stderr)
+            if self._check_tool_repeat(tool_name, tool_input, executed_counts,
+                                       emitted_sigs, blocked_repeats) is None:
                 return False
-            emitted_sigs.add(sig)
 
             try:
                 tool_args = json.dumps(tool_input)
@@ -2357,19 +2371,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
                     # Same loop breaker as the Responses path: never hand the
                     # client a call it already executed in this conversation.
-                    sig = self._tool_signature(tool_name, tool_input)
-                    already = executed_counts.get(sig, 0)
-                    if sig in emitted_sigs or already >= REPEAT_TOOL_LIMIT:
-                        blocked_repeats.append(sig)
-                        print(f"{YELLOW}!{RESET} blocked repeat tool call "
-                              f"(ran {already}x already): {sig[:160]}", file=sys.stderr)
+                    if self._check_tool_repeat(tool_name, tool_input, executed_counts,
+                                               emitted_sigs, blocked_repeats) is None:
                         continue
-                    emitted_sigs.add(sig)
 
                     try:
                         tool_args = json.dumps(tool_input)
                     except Exception:
                         tool_args = json.dumps({"value": str(tool_input)})
+
 
                     send_chunk({
                         "tool_calls": [{
