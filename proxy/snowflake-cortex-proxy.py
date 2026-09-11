@@ -1461,6 +1461,64 @@ class ProxyHandler(BaseHTTPRequestHandler):
     TOOL_CALL_TYPES = ("function_call", "tool_call", "tool_use")
     TOOL_OUTPUT_TYPES = ("function_call_output", "tool_result", "tool_output")
 
+    @staticmethod
+    def _append_or_merge_message(messages: list, role: str, parts: list) -> None:
+        """Append a message, folding into the previous one if same role.
+
+        Cortex requires strict user/assistant alternation, so consecutive
+        same-role messages must be merged rather than sent as separate turns.
+        Shared by both converters below.
+        """
+        if not parts:
+            return
+        if messages and messages[-1].get("role") == role:
+            prev = messages[-1].get("content")
+            if isinstance(prev, list):
+                prev.extend(parts)
+                return
+        messages.append({"role": role, "content": list(parts)})
+
+    @staticmethod
+    def _finalize_message_boundaries(messages: list) -> None:
+        """Enforce Cortex's user-first / user-last message requirements in place.
+
+        Verified against the Agent API: omitting either fixup yields "Last
+        message must be from user" (or the equivalent first-message error).
+        Shared by both converters below.
+        """
+        if not messages:
+            return
+        first = 0
+        while first < len(messages) and messages[first].get("role") == "system":
+            first += 1
+        if first < len(messages) and messages[first].get("role") != "user":
+            messages.insert(first, {"role": "user",
+                                    "content": [{"type": "text", "text": "Continue."}]})
+        if messages[-1].get("role") != "user":
+            messages.append({"role": "user",
+                             "content": [{"type": "text", "text": "Continue."}]})
+
+    def _record_tool_result(self, calls_by_id: Dict[str, Dict[str, Any]],
+                            executed: Dict[str, int], call_id: Optional[str],
+                            name: str, output: Any, is_error: bool) -> list:
+        """Build tool_use/tool_result parts for one completed tool call.
+
+        Synthesizes a fake preceding tool_use if the result arrived without
+        one (Cortex rejects a bare tool_result), and tracks how many times
+        each call signature has already run so the loop breaker can act on
+        it later. Shared by both converters below.
+        """
+        parts = []
+        if not call_id or call_id not in calls_by_id:
+            call_id = call_id or f"toolu_{uuid.uuid4().hex}"
+            calls_by_id[call_id] = {"name": name, "arguments": {}}
+            parts.append(self._build_tool_use_part(call_id, name, {}))
+        args = (calls_by_id.get(call_id) or {}).get("arguments")
+        sig = self._tool_signature(name, args)
+        executed[sig] = executed.get(sig, 0) + 1
+        parts.append(self._build_tool_result_part(call_id, name, output, is_error))
+        return parts
+
     def _convert_kilo_input_to_messages(self, input_items):
         """Convert Kilo's Responses-API `input` array into Cortex messages.
 
@@ -1480,16 +1538,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         calls_by_id: Dict[str, Dict[str, Any]] = {}
 
         def append_or_merge(role: str, parts: list):
-            # Cortex requires strict user/assistant alternation, so fold
-            # consecutive same-role messages together.
-            if not parts:
-                return
-            if messages and messages[-1].get("role") == role:
-                prev = messages[-1].get("content")
-                if isinstance(prev, list):
-                    prev.extend(parts)
-                    return
-            messages.append({"role": role, "content": list(parts)})
+            self._append_or_merge_message(messages, role, parts)
 
         def emit_parts(role: str, parts: list):
             """Route tool_use/tool_result parts onto an assistant message."""
@@ -1527,18 +1576,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             call_id = d.get("call_id") or d.get("tool_use_id") or d.get("id")
             prior = calls_by_id.get(call_id) if call_id else None
             name = d.get("name") or d.get("tool_name") or (prior or {}).get("name") or "bash"
-            parts = []
-            if not call_id or call_id not in calls_by_id:
-                # A tool_result with no preceding tool_use is rejected, so
-                # synthesise the call we never saw replayed.
-                call_id = register_call(call_id, name, {})
-                parts.append(self._build_tool_use_part(call_id, name, {}))
-            args = (calls_by_id.get(call_id) or {}).get("arguments")
-            sig = self._tool_signature(name, args)
-            executed[sig] = executed.get(sig, 0) + 1
-            parts.append(self._build_tool_result_part(
-                call_id, name, self._tool_output_text(d), self._tool_output_is_error(d)))
-            return parts
+            return self._record_tool_result(
+                calls_by_id, executed, call_id, name,
+                self._tool_output_text(d), self._tool_output_is_error(d))
 
         def convert_content(content: Any) -> list:
             """Normalize Kilo/Vercel parts into Cortex content parts."""
@@ -1635,20 +1675,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 else:
                     emit_parts("assistant", tool_result_from(item))
 
-        # Cortex requires the first non-system message to be from the user...
-        if messages:
-            first = 0
-            while first < len(messages) and messages[first].get("role") == "system":
-                first += 1
-            if first < len(messages) and messages[first].get("role") != "user":
-                messages.insert(first, {"role": "user",
-                                        "content": [{"type": "text", "text": "Continue."}]})
-
-        # ...and the last message to be from the user. Verified against the
-        # Agent API: omitting this yields "Last message must be from user".
-        if messages and messages[-1].get("role") != "user":
-            messages.append({"role": "user",
-                             "content": [{"type": "text", "text": "Continue."}]})
+        self._finalize_message_boundaries(messages)
 
         self._executed_tool_signatures = executed
         self._saw_tool_output = saw_tool_output
@@ -1667,14 +1694,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         calls_by_id: Dict[str, Dict[str, Any]] = {}
 
         def append_or_merge(role: str, parts: list):
-            if not parts:
-                return
-            if messages and messages[-1].get("role") == role:
-                prev = messages[-1].get("content")
-                if isinstance(prev, list):
-                    prev.extend(parts)
-                    return
-            messages.append({"role": role, "content": list(parts)})
+            self._append_or_merge_message(messages, role, parts)
 
         def convert_parts(content: Any) -> list:
             if isinstance(content, str):
@@ -1724,16 +1744,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 call_id = msg.get("tool_call_id") or msg.get("call_id") or msg.get("id")
                 prior = calls_by_id.get(call_id) if call_id else None
                 name = msg.get("name") or msg.get("tool_name") or (prior or {}).get("name") or "bash"
-                parts = []
-                if not call_id or call_id not in calls_by_id:
-                    call_id = call_id or f"toolu_{uuid.uuid4().hex}"
-                    calls_by_id[call_id] = {"name": name, "arguments": {}}
-                    parts.append(self._build_tool_use_part(call_id, name, {}))
-                sig = self._tool_signature(
-                    name, (calls_by_id.get(call_id) or {}).get("arguments"))
-                executed[sig] = executed.get(sig, 0) + 1
-                parts.append(self._build_tool_result_part(
-                    call_id, name, msg.get("content", ""), self._tool_output_is_error(msg)))
+                parts = self._record_tool_result(
+                    calls_by_id, executed, call_id, name,
+                    msg.get("content", ""), self._tool_output_is_error(msg))
                 append_or_merge("assistant", parts)
                 continue
 
@@ -1755,17 +1768,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if parts:
                 append_or_merge(role, parts)
 
-        if messages:
-            first = 0
-            while first < len(messages) and messages[first].get("role") == "system":
-                first += 1
-            if first < len(messages) and messages[first].get("role") != "user":
-                messages.insert(first, {"role": "user",
-                                        "content": [{"type": "text", "text": "Continue."}]})
-
-        if messages and messages[-1].get("role") != "user":
-            messages.append({"role": "user",
-                             "content": [{"type": "text", "text": "Continue."}]})
+        self._finalize_message_boundaries(messages)
 
         self._executed_tool_signatures = executed
         self._saw_tool_output = saw_tool_output
