@@ -255,6 +255,7 @@ Licensed under the [MIT License](LICENSE).
 proxy/ksc.py                    ksc launcher (profiles + proxy + kilo)
 proxy/snowflake-auth-sidecar.py auth token manager and lightweight proxy
 proxy/snowflake-cortex-proxy.py translating proxy for Cortex Agent API (advanced)
+proxy/sfauth.py                 shared auth providers (PAT, keypair, OAuth, device code)
 proxy/cortex_models.py          shared Cortex model catalog (single source of truth)
 test/idp.py                     throwaway OIDC IdP for testing device code flow
 install.sh                      one-liner installer (macOS/Linux)

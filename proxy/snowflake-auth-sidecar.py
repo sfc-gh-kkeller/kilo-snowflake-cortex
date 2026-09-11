@@ -17,8 +17,6 @@ Usage:
 """
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import os
 import sys
@@ -26,18 +24,11 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-try:
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.backends import default_backend
-    import jwt as pyjwt
-    HAS_CRYPTO = True
-except ImportError:
-    HAS_CRYPTO = False
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # -- ANSI colors --
 BOLD = "\033[1m"

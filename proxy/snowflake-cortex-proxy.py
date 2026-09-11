@@ -51,20 +51,12 @@ from pathlib import Path
 from typing import Dict, Any, Iterator, Optional
 import uuid
 import time
-import hashlib
 import base64
 import webbrowser
 import threading
 
-# Try to import cryptography for private key auth (optional)
-try:
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.backends import default_backend
-    from cryptography.hazmat.primitives.asymmetric import rsa, padding
-    from cryptography.hazmat.primitives import hashes
-    HAS_CRYPTO = True
-except ImportError:
-    HAS_CRYPTO = False
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sfauth  # noqa: E402
 
 # ANSI colors for output
 RESET = "\033[0m"
@@ -299,48 +291,17 @@ class SnowflakeCortexClient:
         return True
     
     def _auth_private_key(self) -> bool:
-        """Authenticate using private key / JWT."""
-        if not HAS_CRYPTO:
-            raise RuntimeError(
-                "Private key auth requires cryptography library.\n"
-                "Install: pip install cryptography"
-            )
-        
+        """Authenticate using private key / JWT.
+
+        Mints the JWT via the shared sfauth helper, then exchanges it for a
+        Snowflake session token -- agent:run needs a session token, unlike
+        the REST inference API which takes the JWT directly as a bearer
+        token (see _bearer_credentials).
+        """
         key_path = Path(self.auth_config.get("private_key_path", "")).expanduser()
-        if not key_path.exists():
-            raise FileNotFoundError(f"Private key not found: {key_path}")
-        
         passphrase = self.auth_config.get("private_key_passphrase")
-        
-        # Load private key
-        with open(key_path, "rb") as key_file:
-            private_key = serialization.load_pem_private_key(
-                key_file.read(),
-                password=passphrase.encode() if passphrase else None,
-                backend=default_backend()
-            )
-        
-        # Get public key fingerprint
-        public_key = private_key.public_key()
-        public_key_der = public_key.public_bytes(
-            encoding=serialization.Encoding.DER,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-        sha256_hash = hashlib.sha256(public_key_der).digest()
-        public_key_fp = f"SHA256:{base64.b64encode(sha256_hash).decode()}"
-        
-        # Create JWT — iss/sub must use uppercase ORG-ACCOUNT.USER format
-        import jwt
-        qualified_account = self.account.upper().replace(".", "-")
-        qualified_user = self.user.upper()
-        payload = {
-            "iss": f"{qualified_account}.{qualified_user}.{public_key_fp}",
-            "sub": f"{qualified_account}.{qualified_user}",
-            "iat": int(time.time()),
-            "exp": int(time.time()) + 3540  # 59 min (max 60)
-        }
-        token = jwt.encode(payload, private_key, algorithm="RS256")
-        
+        token = sfauth.mint_keypair_jwt(self.account, self.user, key_path, passphrase)
+
         # Authenticate with JWT
         req = urllib.request.Request(
             f"{self.base_url}/session/v1/login-request",
@@ -470,6 +431,10 @@ class SnowflakeCortexClient:
     def _auth_snowflake_oauth(self) -> bool:
         """Authenticate using Snowflake OAuth (authorization code + PKCE).
 
+        Delegates to the shared sfauth module (also used by
+        snowflake-auth-sidecar.py). Refresh-token reuse is handled inside
+        sfauth.auth_snowflake_oauth via the in-memory state store.
+
         Requires a Snowflake OAuth security integration:
             CREATE SECURITY INTEGRATION kilo_cortex_oauth
               TYPE = OAUTH  OAUTH_CLIENT = CUSTOM
@@ -478,130 +443,11 @@ class SnowflakeCortexClient:
               ENABLED = TRUE  OAUTH_ENFORCE_PKCE = TRUE
               OAUTH_ISSUE_REFRESH_TOKENS = TRUE;
         """
-        client_id = self.auth_config.get("client_id")
-        client_secret = self.auth_config.get("client_secret")
-        if not client_id or not client_secret:
-            raise ValueError("snowflake_oauth requires auth.client_id and auth.client_secret")
-
-        redirect_port = int(self.auth_config.get("redirect_port", 8765))
-        redirect_uri = f"http://localhost:{redirect_port}"
-        scope = self.auth_config.get("scope", "")
-
-        # If we have a refresh token from a previous run, try refreshing first
-        if hasattr(self, "_sf_oauth_refresh_token") and self._sf_oauth_refresh_token:
-            try:
-                return self._refresh_snowflake_oauth_token(client_id, client_secret, redirect_uri)
-            except Exception:
-                pass  # fall through to full auth
-
-        # PKCE: generate code_verifier and code_challenge
-        code_verifier = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
-        challenge_digest = hashlib.sha256(code_verifier.encode()).digest()
-        code_challenge = base64.urlsafe_b64encode(challenge_digest).decode().rstrip("=")
-
-        # Start local callback server
-        auth_result = {}
-
-        class OAuthCallbackHandler(BaseHTTPRequestHandler):
-            def log_message(self, format, *args):
-                pass
-
-            def do_GET(self):
-                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                code = query.get("code", [None])[0]
-                error = query.get("error", [None])[0]
-                if code:
-                    auth_result["code"] = code
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html")
-                    self.end_headers()
-                    self.wfile.write(b"<html><body><h2>Authenticated.</h2>"
-                                    b"<p>You can close this window.</p></body></html>")
-                else:
-                    auth_result["error"] = error or "no code received"
-                    self.send_error(400, auth_result["error"])
-
-        callback_server = HTTPServer(("localhost", redirect_port), OAuthCallbackHandler)
-        server_thread = threading.Thread(target=callback_server.handle_request, daemon=True)
-        server_thread.start()
-
-        # Build authorization URL
-        params = urllib.parse.urlencode({
-            "client_id": client_id,
-            "response_type": "code",
-            "redirect_uri": redirect_uri,
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "scope": scope,
-        })
-        auth_url = f"{self.base_url}/oauth/authorize?{params}"
-
-        print(f"{BLUE}->>{RESET} Opening browser for Snowflake OAuth...", file=sys.stderr)
-        print(f"{BLUE}->>{RESET} URL: {auth_url}", file=sys.stderr)
-        webbrowser.open(auth_url)
-
-        server_thread.join(timeout=120)
-        callback_server.server_close()
-
-        if "error" in auth_result:
-            raise RuntimeError(f"OAuth authorization failed: {auth_result['error']}")
-        if "code" not in auth_result:
-            raise TimeoutError("OAuth authorization timeout (120s)")
-
-        # Exchange code for token
-        token_data = urllib.parse.urlencode({
-            "grant_type": "authorization_code",
-            "code": auth_result["code"],
-            "redirect_uri": redirect_uri,
-            "code_verifier": code_verifier,
-        }).encode()
-
-        credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
-        req = urllib.request.Request(
-            f"{self.base_url}/oauth/token-request",
-            data=token_data,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Authorization": f"Basic {credentials}",
-            },
-        )
-        resp = urllib.request.urlopen(req, timeout=30)
-        token_resp = json.loads(resp.read())
-
-        self.token = token_resp.get("access_token")
-        self._sf_oauth_refresh_token = token_resp.get("refresh_token")
-        if not self.token:
-            raise RuntimeError(f"No access_token in OAuth response: {token_resp}")
-
-        print(f"{GREEN}v{RESET} Authenticated via Snowflake OAuth", file=sys.stderr)
-        return True
-
-    def _refresh_snowflake_oauth_token(self, client_id: str, client_secret: str,
-                                        redirect_uri: str) -> bool:
-        """Refresh a Snowflake OAuth access token using the stored refresh token."""
-        token_data = urllib.parse.urlencode({
-            "grant_type": "refresh_token",
-            "refresh_token": self._sf_oauth_refresh_token,
-            "redirect_uri": redirect_uri,
-        }).encode()
-        credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
-        req = urllib.request.Request(
-            f"{self.base_url}/oauth/token-request",
-            data=token_data,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Authorization": f"Basic {credentials}",
-            },
-        )
-        resp = urllib.request.urlopen(req, timeout=30)
-        token_resp = json.loads(resp.read())
-        self.token = token_resp.get("access_token")
-        new_refresh = token_resp.get("refresh_token")
-        if new_refresh:
-            self._sf_oauth_refresh_token = new_refresh
-        if not self.token:
-            raise RuntimeError("Refresh failed: no access_token")
-        print(f"{GREEN}v{RESET} Refreshed Snowflake OAuth token", file=sys.stderr)
+        if not hasattr(self, "_auth_state"):
+            self._auth_state = sfauth.InMemoryAuthStateManager()
+        result = sfauth.auth_snowflake_oauth(self.config, self._auth_state)
+        self.token = result.token
+        print(f"{GREEN}✓{RESET} Authenticated via Snowflake OAuth", file=sys.stderr)
         return True
 
     # ------------------------------------------------------------------
@@ -609,7 +455,10 @@ class SnowflakeCortexClient:
     # ------------------------------------------------------------------
 
     def _auth_device_code(self) -> bool:
-        """Authenticate using an external IdP's device code flow.
+        """Authenticate using an external IdP's device code flow (RFC 8628).
+
+        Delegates to the shared sfauth module. Refresh-token reuse is
+        handled inside sfauth.auth_device_code via the in-memory state store.
 
         Requires an external OAuth integration in Snowflake:
             CREATE SECURITY INTEGRATION kilo_external_oauth
@@ -622,114 +471,11 @@ class SnowflakeCortexClient:
               EXTERNAL_OAUTH_SNOWFLAKE_USER_MAPPING_ATTRIBUTE = 'LOGIN_NAME'
               EXTERNAL_OAUTH_ANY_ROLE_MODE = 'ENABLE';
         """
-        client_id = self.auth_config.get("client_id")
-        device_auth_endpoint = self.auth_config.get("device_authorization_endpoint")
-        token_endpoint = self.auth_config.get("token_endpoint")
-        if not all([client_id, device_auth_endpoint, token_endpoint]):
-            raise ValueError(
-                "device_code requires auth.client_id, "
-                "auth.device_authorization_endpoint, and auth.token_endpoint"
-            )
-
-        scope = self.auth_config.get("scope", "")
-        poll_interval = int(self.auth_config.get("poll_interval", 5))
-
-        # If we have a refresh token, try refreshing first
-        if hasattr(self, "_dc_refresh_token") and self._dc_refresh_token:
-            try:
-                return self._refresh_device_code_token(token_endpoint, client_id)
-            except Exception:
-                pass
-
-        # Step 1: Request device code
-        req_data = urllib.parse.urlencode({
-            "client_id": client_id,
-            "scope": scope,
-        }).encode()
-        req = urllib.request.Request(
-            device_auth_endpoint,
-            data=req_data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        resp = urllib.request.urlopen(req, timeout=30)
-        device_resp = json.loads(resp.read())
-
-        device_code = device_resp["device_code"]
-        user_code = device_resp["user_code"]
-        verification_uri = device_resp.get("verification_uri") or device_resp.get("verification_url", "")
-        interval = device_resp.get("interval", poll_interval)
-        expires_in = device_resp.get("expires_in", 600)
-
-        print(f"\n{BOLD}{YELLOW}  Device code authentication{RESET}", file=sys.stderr)
-        print(f"  Go to: {BOLD}{verification_uri}{RESET}", file=sys.stderr)
-        print(f"  Enter code: {BOLD}{user_code}{RESET}\n", file=sys.stderr)
-
-        # Try to open browser automatically
-        if verification_uri:
-            try:
-                complete_uri = device_resp.get("verification_uri_complete")
-                webbrowser.open(complete_uri or verification_uri)
-            except Exception:
-                pass
-
-        # Step 2: Poll for token
-        deadline = time.time() + expires_in
-        while time.time() < deadline:
-            time.sleep(interval)
-            poll_data = urllib.parse.urlencode({
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                "device_code": device_code,
-                "client_id": client_id,
-            }).encode()
-            poll_req = urllib.request.Request(
-                token_endpoint,
-                data=poll_data,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-            try:
-                poll_resp = urllib.request.urlopen(poll_req, timeout=30)
-                token_resp = json.loads(poll_resp.read())
-                self.token = token_resp.get("access_token")
-                self._dc_refresh_token = token_resp.get("refresh_token")
-                if self.token:
-                    print(f"{GREEN}v{RESET} Authenticated via device code", file=sys.stderr)
-                    return True
-            except urllib.error.HTTPError as e:
-                body = json.loads(e.read())
-                error = body.get("error", "")
-                if error == "authorization_pending":
-                    continue
-                elif error == "slow_down":
-                    interval = min(interval + 5, 30)
-                    continue
-                elif error == "expired_token":
-                    raise TimeoutError("Device code expired before approval")
-                else:
-                    raise RuntimeError(f"Device code poll error: {error} - {body.get('error_description','')}")
-
-        raise TimeoutError(f"Device code flow timed out after {expires_in}s")
-
-    def _refresh_device_code_token(self, token_endpoint: str, client_id: str) -> bool:
-        """Refresh an external OAuth token using the stored refresh token."""
-        data = urllib.parse.urlencode({
-            "grant_type": "refresh_token",
-            "refresh_token": self._dc_refresh_token,
-            "client_id": client_id,
-        }).encode()
-        req = urllib.request.Request(
-            token_endpoint,
-            data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        resp = urllib.request.urlopen(req, timeout=30)
-        token_resp = json.loads(resp.read())
-        self.token = token_resp.get("access_token")
-        new_refresh = token_resp.get("refresh_token")
-        if new_refresh:
-            self._dc_refresh_token = new_refresh
-        if not self.token:
-            raise RuntimeError("Refresh failed: no access_token")
-        print(f"{GREEN}v{RESET} Refreshed external OAuth token", file=sys.stderr)
+        if not hasattr(self, "_auth_state"):
+            self._auth_state = sfauth.InMemoryAuthStateManager()
+        result = sfauth.auth_device_code(self.config, self._auth_state)
+        self.token = result.token
+        print(f"{GREEN}✓{RESET} Authenticated via device code", file=sys.stderr)
         return True
 
     def _convert_tools_to_cortex_format(self, tools: list) -> list:
